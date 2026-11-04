@@ -1,0 +1,28 @@
+name: vigor
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=23
+  - numpy>=1.22
+  - pandas>=1.4
+  - scipy>=1.8
+  - scikit-learn>=1.0
+  - xarray>=2025.10
+  - dask>=2025.10
+  - zarr>=3.1
+  - nbformat>=5.9
+  - nbclient>=0.10
+  - ipykernel>=6
+  - pyarrow>=8.0
+  - threadpoolctl>=3.0
+  - psutil>=5.9
+  - hvplot>=0.10
+  - holoviews>=1.18
+  - bokeh>=3.4
+  - panel>=1.4
+  - pytest>=7.0
+  - ruff>=0.6
+  - build>=1.2
+  - pip:
+      - "VIGOR[hpo,io,progress,plot] @ git+https://github.com/sanchestm/VIGOR"

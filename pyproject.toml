@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "VIGOR"
+version = "2.12.1"
+description = "Scalable genomic latent covariance decomposition, breeding-value prediction, multivariate association, and causal inference."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "unculturedbacterium" }]
+keywords = [
+    "GWAS",
+    "dominance",
+    "genetics",
+    "quantitative-genetics",
+    "mixed-model",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.22",
+    "pandas>=1.4",
+    "scipy>=1.8",
+    "scikit-learn>=1.0",
+    "threadpoolctl>=3.0",
+    "psutil>=5.9",
+    "networkx>=3.0",
+    "requests>=2.28",
+    "tqdm>=4.64",
+    "xarray>=2025.10",
+    "dask[array]>=2025.10",
+    "zarr>=3.1",
+]
+
+[project.optional-dependencies]
+hpo = ["optuna>=4,<6"]
+progress = ["fastprogress>=1.1.6"]
+bundle = ["scikit-image>=0.22"]
+plot = ["datashader>=0.16", "hvplot>=0.12", "holoviews>=1.18", "bokeh>=3.4", "panel>=1.4"]
+io = ["pyarrow>=8.0", "xarray>=2024.1", "dask[array,dataframe]>=2024.1", "zarr>=3", "fsspec>=2024.1", "pysam>=0.22", "pgenlib>=0.93", "zstandard>=0.22"]
+network = ["pcst-fast>=1.0"]
+scale = ["xarray>=2024.1", "dask[array]>=2024.1", "numba>=0.59"]
+ml = ["lightgbm>=4", "shap>=0.45", "umap-learn>=0.5"]
+test = ["pytest>=7.0", "ruff>=0.6", "build>=1.2", "nbformat>=5.9", "nbclient>=0.10", "ipykernel>=6"]
+cuda = ["cupy-cuda12x>=12.0"]
+
+[project.urls]
+Homepage = "https://github.com/sanchestm/VIGOR"
+Repository = "https://github.com/sanchestm/VIGOR"
+Issues = "https://github.com/sanchestm/VIGOR/issues"
+Documentation = "https://github.com/sanchestm/VIGOR#readme"
+
+[project.scripts]
+vigor = "vigor.cli:main"
+vigor-blup = "vigor.blup:main"
+domino = "domino.cli:main"
+domino-blup = "domino.blup:main"
+
+[tool.setuptools.packages.find]
+include = ["vigor*", "domino*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
