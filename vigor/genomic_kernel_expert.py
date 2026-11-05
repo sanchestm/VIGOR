@@ -2166,7 +2166,7 @@ def fit_genomic_kernel_expert_xarray(
     io_chunk_variants='auto',score_chunk_variants=None,calibration_n=4096,scan_top_k=2048,region_p_threshold=1e-5,region_padding_bp=1_000_000,
     recombination_rate_cM_per_mb=.5,merge_recombination_cM=1.,scan_zarr_path=None,exact_rescore_fn=None,exact_rescore_p=5e-7,exact_rescore_top=64,
     max_region_variants=8192,raw_variants_per_region=96,ld_max_distance_bp=1_000_000,ld_max_distance_cm=None,ld_sample_rows=2048,ld_block_variants=256,ld_prune_r2=.95,ld_component_r2=.20,max_ld_groups_per_region=8,
-    founder_feature_fn=None,loco_score_states=None,assume_complete=False,grouped_ridge_min_cv_gain=.001,local_model_methods=None,local_model_min_cv_gain=.005,compute_shap=True,random_state=0,discovery_train_mask=None,scan_progress_callback=None,precomputed_scan=None,scan_result_callback=None,maxmem=None,memory_fraction=None):
+    founder_feature_fn=None,loco_score_states=None,assume_complete=False,grouped_ridge_min_cv_gain=.001,local_model_methods=None,local_model_min_cv_gain=.005,compute_shap=True,random_state=0,discovery_train_mask=None,scan_progress_callback=None,precomputed_scan=None,scan_result_callback=None,maxmem=None,memory_fraction=None,null_A=None):
     """Fit genomic kernel expert xarray.
 
     Parameters
@@ -2431,6 +2431,13 @@ def fit_genomic_kernel_expert_xarray(
         described by the summary. Default: ``True``. Passed to ``fit_prefiltered_factor_models``
         as ``compute_shap``.
 
+    null_A : array-like or None
+        Duals of simulated null traits (reps x n x traits), e.g. from
+        ``vigor.mvgwas_fast.null_trait_duals(null)``; they calibrate the scan.
+        None falls back to animal-permuted copies of ``dual_A``, which ignores
+        relatedness and is suitable for ranking candidate regions only.
+        Default: ``None``.
+
     random_state : int or None
         Seed controlling randomized sampling, folds or projections for reproducibility. None
         uses the selected random-number backend without a fixed seed. Default: ``0``. Passed to
@@ -2480,7 +2487,13 @@ def fit_genomic_kernel_expert_xarray(
         for name,sc,_,_ in rows:scores.append((name,sc,"kernel"));bank[f"kernel::{name}"]=kb[name]
     elif selected_chromosomes is not None:selected_chromosomes=list(map(str,selected_chromosomes))
     lazy_genotypes=mf.open_genotype_xarray(genotypes,io_chunk_variants=io_chunk_variants,sample_ids=sample_ids,maxmem=maxmem,memory_fraction=memory_fraction)
-    shared_state=mf.prepare_fast_score_state(dual_A,Gtot,E,rank=min(trait_rank,Y0.shape[1]),basis="canonical",train_mask=discovery)
+    if null_A is None:
+        # Feature discovery only ranks regions; a permutation null keeps the scan calibrated
+        # for that purpose without a covariance model (it ignores relatedness).
+        import warnings
+        warnings.warn("no null-trait duals supplied; calibrating the discovery scan with permuted duals (ranking only)",RuntimeWarning,stacklevel=2)
+        A0=_to_numpy(dual_A,float);rng=np.random.default_rng(random_state);null_A=np.stack([A0[rng.permutation(len(A0))] for _ in range(4)])
+    shared_state=mf.prepare_fast_score_state(dual_A,Gtot,E,rank=min(trait_rank,Y0.shape[1]),basis="canonical",train_mask=discovery,null_A=null_A)
     scan_state=shared_state if loco_score_states is None else loco_score_states
     # Cache reuse is allowed only for an identical file-backed discovery null,
     # allele/sample ordering and genotype source stat signature.

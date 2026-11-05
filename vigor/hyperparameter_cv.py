@@ -162,7 +162,7 @@ def _standardized_losses(reference: pd.DataFrame, prediction, kind, train: pd.Da
     """
     truth = reference.to_numpy(float)
     pred = np.asarray(prediction, float)
-    sd = train.std(ddof=0).to_numpy(float)
+    sd = train.std(ddof=0).to_numpy(float).copy()  # read-only view under pandas>=3 copy-on-write
     sd[~np.isfinite(sd) | (sd < 1e-8)] = 1.0
     sq = ((pred - truth) / sd[None, :]) ** 2
     out = {}

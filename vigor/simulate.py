@@ -54,7 +54,7 @@ def _rng(seed=None):
     return np.random.default_rng(seed)
 
 
-def _as_frame(x, index=None, columns=None, prefix="trait"):
+def _as_frame(x, index=None, columns=None, prefix="trait", copy=True):
     """Convert inputs to frame.
 
     Parameters
@@ -78,14 +78,23 @@ def _as_frame(x, index=None, columns=None, prefix="trait"):
         PLINK fileset prefix without the .bed/.bim/.fam suffix (or .pgen/.pvar/.psam for a
         PLINK2 adapter). Companion metadata and genotype files must describe the same samples
         and variants. Default: ``'trait'``.
+
+    copy : bool
+        Whether to return an independent copy of the values. False wraps the existing
+        DataArray/ndarray buffer (or returns a shallow DataFrame copy) so a large genotype
+        matrix is not duplicated; the caller must then not mutate the result. Default: ``True``.
     """
     if hasattr(x, "to_pandas") and hasattr(x, "dims"):
         # Labeled DataArray (e.g. ``simulate_genotypes(...)['genotypes']``).
+        if not copy and x.ndim == 2:
+            r, c = x.dims
+            return pd.DataFrame(np.asarray(x.values), index=pd.Index(np.asarray(x[r].values)),
+                                columns=pd.Index(np.asarray(x[c].values)), copy=False)
         x = x.to_pandas().copy()
         x.index.name = x.columns.name = None
         return x
     if isinstance(x, pd.DataFrame):
-        return x.copy()
+        return x.copy(deep=bool(copy))
     a = np.asarray(x)
     if a.ndim != 2:
         raise ValueError("expected a 2D matrix")
@@ -93,7 +102,7 @@ def _as_frame(x, index=None, columns=None, prefix="trait"):
         index = [f"ID{i:05d}" for i in range(a.shape[0])]
     if columns is None:
         columns = [f"{prefix}{j+1}" for j in range(a.shape[1])]
-    return pd.DataFrame(a, index=index, columns=columns)
+    return pd.DataFrame(a, index=index, columns=columns, copy=None if copy else False)
 
 
 def _cov_frame(x: pd.DataFrame) -> pd.DataFrame:
@@ -544,6 +553,102 @@ def gcta_codings(genotypes, allele_frequency=None, *, min_maf=1e-6):
     )
     D[~valid] = 0.0
     return A, D, p
+
+
+def _variant_block_size(n_samples, target_bytes=256 * 2**20, itemsize=4):
+    """Return a variant block width whose float32 sample-by-variant block fits a byte target.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of rows in each block.
+
+    target_bytes : int
+        Approximate bytes per working block. Default: ``256 MiB``.
+
+    itemsize : int
+        Bytes per element of the working dtype. Default: ``4`` (float32).
+    """
+    return int(max(1, int(target_bytes) // max(1, int(n_samples) * int(itemsize))))
+
+
+def _blockwise_allele_frequency(X, block_variants=None):
+    """Estimate per-variant alternate-allele frequencies without a full float copy.
+
+    Columns are read in bounded float32 blocks; sums are accumulated in float64.
+    Missing calls (NaN) are excluded from both numerator and denominator.
+
+    Parameters
+    ----------
+    X : array-like
+        Sample-by-variant dosage matrix (NumPy array or any object supporting 2D column
+        slicing, such as a Dask array). Values are 0/1/2 dosages with NaN for missing calls.
+
+    block_variants : int or None
+        Variants per working block. None sizes blocks to about 256 MiB of float32.
+        Default: ``None``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float64 vector of length ``X.shape[1]``; NaN for variants with no observed calls.
+    """
+    n, m = int(X.shape[0]), int(X.shape[1])
+    step = int(block_variants) if block_variants else _variant_block_size(n)
+    p = np.full(m, np.nan, dtype=np.float64)
+    for start in range(0, m, step):
+        blk = X[:, start:start + step]
+        if hasattr(blk, "compute"):
+            blk = blk.compute()
+        b = np.asarray(blk, dtype=np.float32)
+        ok = np.isfinite(b)
+        cnt = ok.sum(axis=0)
+        s = np.where(ok, b, np.float32(0)).sum(axis=0, dtype=np.float64)
+        p[start:start + b.shape[1]] = np.divide(s, 2.0 * cnt, out=np.full(b.shape[1], np.nan),
+                                                where=cnt > 0)
+    return p
+
+
+class _CausalCodings:
+    """Lazily build PLINK/GCTA additive and Vitezica dominance codings for single columns.
+
+    Only the columns actually used by the simulated architecture (causal, epistatic and
+    GxE loci) are ever coded, so memory is O(n x n_causal) instead of O(n x M).
+
+    Parameters
+    ----------
+    X : array-like
+        Sample-by-variant dosage matrix supporting ``X[:, j]`` column access.
+
+    p : numpy.ndarray
+        Clipped per-variant allele frequencies used for centering (length ``X.shape[1]``).
+    """
+
+    def __init__(self, X, p):
+        """Store the genotype source and frequencies; no coding is computed yet."""
+        self._X = X
+        self._p = p
+        self._cache = {}
+
+    def _get(self, j):
+        """Return the cached ``(additive, dominance)`` float64 column pair for variant ``j``."""
+        j = int(j)
+        if j not in self._cache:
+            col = self._X[:, j]
+            if hasattr(col, "compute"):
+                col = col.compute()
+            g = np.asarray(col, dtype=np.float64).reshape(-1, 1)
+            A, D, _ = gcta_codings(g, allele_frequency=self._p[j:j + 1], min_maf=1e-6)
+            self._cache[j] = (A[:, 0], D[:, 0])
+        return self._cache[j]
+
+    def A(self, j):
+        """Additive coding ``g - 2p`` (missing coded 0) of variant ``j``."""
+        return self._get(j)[0]
+
+    def D(self, j):
+        """Vitezica dominance coding (missing coded 0) of variant ``j``."""
+        return self._get(j)[1]
 
 
 def _causal_effect_matrix(rng, m, T, n_causal, p, *, trait_hit_rate=0.25,
@@ -1158,8 +1263,17 @@ def simulate_traits_from_genotypes(
         uses the selected random-number backend without a fixed seed. Default: ``0``.
 
     compute_grms : bool
-        Context/control value read by the enclosing operation; its contract follows the explicit
-        local use and the caller. Default: ``True``.
+        Whether to attach additive and Vitezica dominance GRMs (global-HWE normalization),
+        built by :func:`vigor.multivariate.genomic_grms_from_genotypes` from bounded float32
+        variant blocks. Variants with MAF below 1e-4 are excluded from the kernels. Sample IDs
+        must be unique. Default: ``True``.
+
+    Notes
+    -----
+    Memory: the genotype matrix is not copied to float64. Allele frequencies are computed
+    in bounded float32 column blocks, and additive/dominance codings are built only for the
+    loci used by the simulated architecture, so working memory beyond the input genotypes is
+    O(n x n_causal + n^2) rather than O(n x M).
 
     Returns
     -------
@@ -1167,14 +1281,21 @@ def simulate_traits_from_genotypes(
         Computed result from ``GenomicSimulationResult(genotypes=Gdf, phenotypes=phenotypes, components=components, trait_covariances=covs, variant_info=vi, variant_effects=variant_effects, epistasis_effects=epistasis_effects, e...``; see the summary and the called implementation for its labeled/numerical representation.
     """
     rng = _rng(seed)
-    Gdf = _as_frame(genotypes, prefix="v")
-    X = Gdf.to_numpy(float); n, m = X.shape; T = int(n_traits)
+    # Memory: the genotype matrix is wrapped without a float64 copy; allele
+    # frequencies are computed in bounded float32 blocks and A/D codings are
+    # built only for the loci used by the architecture (B3/B12.4).
+    Gdf = _as_frame(genotypes, prefix="v", copy=False)
+    X = Gdf.to_numpy(copy=False)
+    if not np.issubdtype(X.dtype, np.floating):
+        X = X.astype(np.float32)
+    n, m = X.shape; T = int(n_traits)
     if T < 1:
         raise ValueError("n_traits must be >=1")
     traits = list(trait_names) if trait_names is not None else [f"trait{t+1}" for t in range(T)]
     if len(traits) != T:
         raise ValueError("trait_names length must equal n_traits")
-    Acode, Dcode, p = gcta_codings(X)
+    p = np.clip(_blockwise_allele_frequency(X), 1e-6, 1.0 - 1e-6)
+    codes = _CausalCodings(X, p)
     maf = np.minimum(p, 1.0 - p)
     candidate = np.flatnonzero(maf >= 0.01)
     if len(candidate) < 2:
@@ -1228,11 +1349,11 @@ def simulate_traits_from_genotypes(
     A_main = np.zeros((n, T)); D_main = np.zeros((n, T))
     A_pen = np.zeros((n, T)); D_pen = np.zeros((n, T))
     for k, j in enumerate(ia_active):
-        locus = Acode[:, j:j+1] * BA[j:j+1, :]
+        locus = codes.A(j)[:, None] * BA[j:j+1, :]
         A_main += pA[k] * locus
         A_pen += (gateA[:, k:k+1] - pA[k]) * locus
     for k, j in enumerate(id_active):
-        locus = Dcode[:, j:j+1] * BD[j:j+1, :]
+        locus = codes.D(j)[:, None] * BD[j:j+1, :]
         D_main += pD[k] * locus
         D_pen += (gateD[:, k:k+1] - pD[k]) * locus
 
@@ -1246,11 +1367,11 @@ def simulate_traits_from_genotypes(
     for pair_id in range(int(n_epistatic_pairs)):
         j, k = rng.choice(candidate, size=2, replace=False)
         kind = str(rng.choice(mk, p=probs))
-        c1 = Acode[:, j] if kind[0] == "A" else Dcode[:, j]
-        c2 = Acode[:, k] if kind[1] == "A" else Dcode[:, k]
+        c1 = codes.A(j) if kind[0] == "A" else codes.D(j)
+        c2 = codes.A(k) if kind[1] == "A" else codes.D(k)
         z = c1 * c2
         if orthogonalize_epistasis:
-            Q = np.column_stack([np.ones(n), Acode[:, j], Acode[:, k], Dcode[:, j], Dcode[:, k]])
+            Q = np.column_stack([np.ones(n), codes.A(j), codes.A(k), codes.D(j), codes.D(k)])
             z = z - Q @ np.linalg.lstsq(Q, z, rcond=None)[0]
         hit = rng.random(T) < float(trait_hit_rate)
         if not np.any(hit): hit[rng.integers(0, T)] = True
@@ -1281,7 +1402,7 @@ def simulate_traits_from_genotypes(
             Earr = H if use_hidden else O
             eidx = int(rng.integers(0, Earr.shape[1]))
             coding = "additive" if rng.random() < 0.75 else "dominance"
-            code = Acode[:, j] if coding == "additive" else Dcode[:, j]
+            code = codes.A(j) if coding == "additive" else codes.D(j)
             hit = rng.random(T) < float(trait_hit_rate)
             if not np.any(hit): hit[rng.integers(0, T)] = True
             beta = _effect_draw(rng, T, effect_distribution, effect_df) * hit
@@ -1416,10 +1537,25 @@ def simulate_traits_from_genotypes(
 
     grms = {}
     if compute_grms:
-        denomA = float(np.sum(2*p*(1-p)))
-        denomD = float(np.sum((2*p*(1-p))**2))
-        grms["additive"] = pd.DataFrame((Acode @ Acode.T) / max(denomA, _EPS), index=idx, columns=idx)
-        grms["dominance"] = pd.DataFrame((Dcode @ Dcode.T) / max(denomD, _EPS), index=idx, columns=idx)
+        # Blockwise float32 ssyrk accumulation with the same global-HWE (Vitezica)
+        # normalization as before; no n x M coding matrix is ever materialized.
+        from .multivariate import genomic_grms_from_genotypes
+        sid = [str(s) for s in idx]
+        include = ("additive", "dominance")
+        try:
+            kds = genomic_grms_from_genotypes(X, method="vitezica", include=include,
+                                              dtype=np.float32, sample_ids=sid)
+        except ValueError as exc:
+            # Fractional dosages have no Vitezica dominance coding; keep the additive GRM.
+            if "dominance" not in str(exc):
+                raise
+            include = ("additive",)
+            kds = genomic_grms_from_genotypes(X, method="vitezica", include=include,
+                                              dtype=np.float32, sample_ids=sid)
+        for comp in include:
+            kv = kds[comp]
+            grms[comp] = pd.DataFrame(np.asarray(getattr(kv, "values", kv)), index=idx, columns=idx)
+    del codes
 
     realized_h2 = np.diag(covs["G_total"]) / np.maximum(np.diag(covs["G_total"] + covs["E_total"]), _EPS)
     truth = {
@@ -1648,6 +1784,242 @@ def simulate_from_plink1(prefix, *, sample_ids=None, n_traits=12, seed=0,
                     "max_variants": None if max_variants is None else int(max_variants)}), save_path)
 
 
+def simulate_genotypes_to_zarr(
+    n_samples: int,
+    n_variants: int,
+    n_chromosomes: int,
+    path,
+    *,
+    model: str = "hs_founder_mosaic",
+    n_founders: int = 8,
+    chromosome_length_mb: float = 100.0,
+    recombination_rate_cM_per_mb: float = 0.5,
+    generations: float = 100.0,
+    founder_af_beta: tuple[float, float] = (0.8, 0.8),
+    min_founder_mac: int = 1,
+    missing_rate: float = 0.0,
+    seed: int | None = 0,
+    overwrite: bool = False,
+    pack_hardcalls: bool = True,
+):
+    """Simulate a large genotype panel chromosome by chromosome straight to a Zarr v3 store.
+
+    A lazy Dask array is assembled with exactly one :func:`simulate_genotypes` call per
+    chromosome as one variant chunk, and written with
+    :func:`vigor.data_model.write_genotype_zarr` using ``variant_chunk`` equal to the
+    chromosome size. Only one or two chromosomes are ever held in memory, so the full
+    ``n_samples x n_variants`` matrix is never materialized. Chromosomes segregate
+    independently; each draws its own founder haplotypes and mosaics from a child seed
+    spawned from ``seed``.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of simulated animals (rows); must be >= 2.
+
+    n_variants : int
+        Total number of variants, split as evenly as possible over chromosomes (the first
+        ``n_variants % n_chromosomes`` chromosomes get one extra variant). Each chromosome
+        needs at least 2 variants.
+
+    n_chromosomes : int
+        Number of chromosomes (= Dask/Zarr variant chunks). Must be >= 1.
+
+    path : str or os.PathLike
+        Destination ``.zarr`` directory.
+
+    model : str
+        Genotype model passed to :func:`simulate_genotypes` (``'hs_founder_mosaic'`` or
+        ``'hwe_independent'``). Default: ``'hs_founder_mosaic'``.
+
+    n_founders, chromosome_length_mb, recombination_rate_cM_per_mb, generations, founder_af_beta, min_founder_mac, missing_rate
+        Passed unchanged to :func:`simulate_genotypes` for each chromosome; see that function.
+
+    seed : int or None
+        Master seed; one child seed per chromosome is spawned with
+        ``numpy.random.SeedSequence``. Default: ``0``.
+
+    overwrite : bool
+        Whether an existing destination may be replaced. Default: ``False``.
+
+    pack_hardcalls : bool
+        Store hard calls as packed 2-bit bytes (``GT_packed2``). Default: ``True``.
+
+    Returns
+    -------
+    str
+        The written store path; open it with :func:`vigor.data_model.open_genotype_dataset`
+        or pass it to :func:`simulate_from_zarr`.
+
+    Notes
+    -----
+    Peak memory is about two chromosome blocks of float32 (``2 * 4 * n_samples *
+    n_variants / n_chromosomes`` bytes) plus the per-chromosome simulation scratch
+    (int8 haplotypes, ``2 * n_samples * chunk`` bytes). A small two-chromosome cache
+    prevents recomputation when the writer's 4-variant-aligned windows straddle a
+    chromosome boundary.
+    """
+    import threading
+    import xarray as xr
+    import dask.array as da
+    from dask import delayed
+    from .data_model import write_genotype_zarr
+
+    n = int(n_samples); m = int(n_variants); C = int(n_chromosomes)
+    if n < 2 or C < 1 or m < 2 * C:
+        raise ValueError("n_samples>=2, n_chromosomes>=1 and n_variants>=2*n_chromosomes are required")
+    per = _allocate_counts(m, C)
+    chrom = np.repeat(np.arange(1, C + 1).astype(str), per)
+    positions = np.concatenate([
+        np.linspace(1, max(2, int(chromosome_length_mb * 1e6)), k, dtype=np.int64) for k in per
+    ])
+    names = _variant_names(chrom, positions)
+    ids = [f"ID{i:05d}" for i in range(n)]
+    child = np.random.SeedSequence(seed).spawn(C)
+    seeds = [int(s.generate_state(1)[0]) for s in child]
+    kwargs = dict(model=model, n_founders=n_founders, chromosome_length_mb=chromosome_length_mb,
+                  recombination_rate_cM_per_mb=recombination_rate_cM_per_mb,
+                  generations=generations, founder_af_beta=founder_af_beta,
+                  min_founder_mac=min_founder_mac, missing_rate=missing_rate)
+    cache = {}; order = []; lock = threading.Lock()
+
+    def chromosome_block(ci):
+        """Simulate (or return the cached) float32 dosage block of chromosome ``ci``."""
+        with lock:
+            if ci in cache:
+                return cache[ci]
+        ds = simulate_genotypes(n_samples=n, n_variants=int(per[ci]), n_chromosomes=1,
+                                seed=seeds[ci], **kwargs)
+        block = np.ascontiguousarray(np.asarray(ds["genotypes"].values, dtype=np.float32))
+        del ds
+        with lock:
+            cache[ci] = block; order.append(ci)
+            while len(order) > 2:
+                cache.pop(order.pop(0), None)
+        return block
+
+    pieces = [da.from_delayed(delayed(chromosome_block, pure=False)(ci), shape=(n, int(k)),
+                              dtype=np.float32) for ci, k in enumerate(per)]
+    gt = da.concatenate(pieces, axis=1) if len(pieces) > 1 else pieces[0]
+    dset = xr.Dataset(
+        {"GT": (("sample", "variant"), gt)},
+        coords={"sample": np.asarray(ids, dtype=object), "variant": np.asarray(names, dtype=object),
+                "chromosome": ("variant", chrom.astype(object)),
+                "position": ("variant", positions.astype(np.int64))},
+    )
+    out = write_genotype_zarr(dset, path, pack_hardcalls=pack_hardcalls,
+                              variant_chunk=int(per.max()), overwrite=overwrite)
+    cache.clear()
+    return out
+
+
+def _string_labels(values):
+    """Coerce coordinate labels (including Zarr v3 StringDType) to a Python-string object array.
+
+    Parameters
+    ----------
+    values : array-like
+        Coordinate values to coerce.
+    """
+    return np.array([str(v) for v in np.asarray(values)], dtype=object)
+
+
+def simulate_from_zarr(path, *, sample_ids=None, max_variants=None, n_traits=12, seed=0,
+                       trait_kwargs=None, block_variants=None, save_path=None):
+    """Generate mechanistic phenotypes from a VIGOR genotype Zarr store.
+
+    The store is opened lazily with :func:`vigor.data_model.open_genotype_dataset`; only the
+    selected variant panel is decoded, in bounded blocks, into one float32 matrix that is
+    passed to :func:`simulate_traits_from_genotypes`. Use ``max_variants`` to take a
+    deterministic evenly spaced panel from very large stores (for example those written
+    by :func:`simulate_genotypes_to_zarr`).
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Genotype Zarr store (canonical ``genotype`` group with ``GT`` or ``GT_packed2``).
+
+    sample_ids : sequence of str or None
+        Animals to keep, in output order. None keeps every sample in store order.
+        Default: ``None``.
+
+    max_variants : int or None
+        Size of an evenly spaced variant panel. None uses all variants (materializing
+        ``4 * n_samples * n_variants`` bytes). Default: ``None``.
+
+    n_traits : int
+        Number of simulated traits. Default: ``12``.
+
+    seed : int or None
+        Seed for the trait architecture. Default: ``0``.
+
+    trait_kwargs : mapping or None
+        Extra keyword arguments for :func:`simulate_traits_from_genotypes`. Default: ``None``.
+
+    block_variants : int or None
+        Variants decoded per block while reading the panel; None sizes blocks to about
+        256 MiB of float32. Default: ``None``.
+
+    save_path : str or os.PathLike or None
+        Optional .zarr path; when given the result is written as consolidated, sharded Zarr v3
+        and returned reopened lazily. Default: ``None``.
+
+    Returns
+    -------
+    xarray.Dataset
+        ``GenomicSimulationResult.to_dataset()`` with the same variables and attrs as
+        :func:`simulate_from_plink1`; ``chrom``/``pos`` come from the store's
+        ``chromosome``/``position`` coordinates when present, and ``attrs['metadata']``
+        also records ``zarr_source`` and ``zarr_variant_panel_size``.
+    """
+    from .data_model import open_genotype_dataset
+    ds = open_genotype_dataset(str(path), source_format="zarr")
+    if "GT" not in ds:
+        raise ValueError("genotype store has no hard-call GT variable")
+    gt = ds["GT"].transpose("sample", "variant")
+    all_ids = _string_labels(gt["sample"].values)
+    n_all, m_all = int(gt.sizes["sample"]), int(gt.sizes["variant"])
+    if sample_ids is None:
+        rows = np.arange(n_all); ids = all_ids
+    else:
+        ids = _string_labels(sample_ids)
+        rows = pd.Index(all_ids).get_indexer(ids)
+        if np.any(rows < 0):
+            raise KeyError(f"genotype store is missing requested sample(s): {ids[rows < 0][:5].tolist()}")
+    if max_variants is None or int(max_variants) >= m_all:
+        vidx = np.arange(m_all)
+    else:
+        vidx = np.unique(np.linspace(0, m_all - 1, int(max_variants), dtype=int))
+    names = _string_labels(gt["variant"].values)[vidx]
+    X = np.empty((len(rows), len(vidx)), dtype=np.float32)
+    step = int(block_variants) if block_variants else _variant_block_size(n_all)
+    sub = gt if len(rows) == n_all and np.array_equal(rows, np.arange(n_all)) else gt.isel(sample=rows)
+    for a in range(0, len(vidx), step):
+        sel = vidx[a:a + step]
+        # Contiguous ranges use a slice so lazy packed decoding reads only those chunks.
+        if sel[-1] - sel[0] + 1 == len(sel):
+            blk = sub.isel(variant=slice(int(sel[0]), int(sel[-1]) + 1))
+        else:
+            blk = sub.isel(variant=sel)
+        X[:, a:a + len(sel)] = np.asarray(blk.values, dtype=np.float32)
+    Gdf = pd.DataFrame(X, index=pd.Index(ids), columns=pd.Index(names), copy=False)
+    res = simulate_traits_from_genotypes(Gdf, n_traits=n_traits, seed=seed, **dict(trait_kwargs or {}))
+    vi = pd.DataFrame(index=pd.Index(names))
+    if "chromosome" in gt.coords:
+        vi["chrom"] = _string_labels(gt["chromosome"].values)[vidx].astype(str)
+    if "position" in gt.coords:
+        vi["pos"] = np.asarray(gt["position"].values)[vidx].astype(np.int64)
+    for c in res.variant_info.columns:
+        vi[c] = res.variant_info[c].to_numpy()
+    res.variant_info = vi
+    res.metadata["zarr_source"] = str(path)
+    res.metadata["zarr_variant_panel_size"] = int(len(vidx))
+    return maybe_save(res.to_dataset(
+        software="vigor.simulate.simulate_from_zarr",
+        parameters={"path": str(path), "n_traits": int(n_traits), "seed": seed,
+                    "max_variants": None if max_variants is None else int(max_variants)}), save_path)
+
+
 def write_simulation_plink(sim, prefix):
     """Write a simulation's genotypes as a PLINK1 BED/BIM/FAM fileset.
 
@@ -1748,4 +2120,5 @@ __all__ = [
     "GenomicSimulationResult", "simulate_genotypes", "gcta_codings",
     "simulate_traits_from_genotypes", "simulate_genomic_dataset",
     "simulate_from_plink1", "simulation_scenario",
+    "simulate_genotypes_to_zarr", "simulate_from_zarr",
 ]

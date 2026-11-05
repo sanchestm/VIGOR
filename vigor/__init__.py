@@ -99,7 +99,8 @@ from .prediction_experts import (
 
 from .simulate import (GenomicSimulationResult, simulate_genotypes, gcta_codings,
                        simulate_traits_from_genotypes, simulate_genomic_dataset,
-                       simulate_from_plink1, simulation_scenario, write_simulation_plink)
+                       simulate_from_plink1, simulation_scenario, write_simulation_plink,
+                       simulate_genotypes_to_zarr, simulate_from_zarr)
 
 __version__ = "2.12.1"
 

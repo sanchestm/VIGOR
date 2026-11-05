@@ -63,11 +63,9 @@ Documentation = "https://github.com/sanchestm/VIGOR#readme"
 [project.scripts]
 vigor = "vigor.cli:main"
 vigor-blup = "vigor.blup:main"
-domino = "domino.cli:main"
-domino-blup = "domino.blup:main"
 
 [tool.setuptools.packages.find]
-include = ["vigor*", "domino*"]
+include = ["vigor*"]
 
 [tool.ruff]
 line-length = 100

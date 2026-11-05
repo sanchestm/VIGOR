@@ -100,8 +100,7 @@ vigor.organize_scores(Y, fit)['heritability_table'].to_pandas()   # h2, h2_se, h
 ```
 
 The h² prior shrinks noisy heritabilities toward their group mean inside the fit;
-its intervals target average coverage across a group of traits (see
-[docs/H2_PRIOR.md](docs/H2_PRIOR.md)).
+its intervals target average coverage across a group of traits.
 
 ### Sparse factor analysis
 
@@ -152,8 +151,30 @@ The search tunes ranks, ridges, the sparse penalty and the h² prior by held-out
 genetic prediction. It picks residual shrinkage per candidate from a cheap inner
 grid and supports pruning, warm starts, time limits and resume. Use
 `vigor.predict_hyperopt` for the selected deployment view and
-`vigor.resume_hyperopt` to recover an interrupted run (see
-[docs/HYPER_OPT.md](docs/HYPER_OPT.md)).
+`vigor.resume_hyperopt` to recover an interrupted run.
+
+### Multivariate GWAS
+
+```python
+gwas = vigor.mvGWAS('genotypes/genotypes', Y, model='add-dom')   # exact score test, LOCO kernels
+```
+
+The exact engine tests every variant in the full observed-space model. With complete
+phenotypes and one kernel it diagonalises V once per LOCO kernel, so a block of
+variants costs one matrix product rather than one solve per variant. With missing cells
+it uses block PCG, with the fixed-effect projection cached.
+
+For genome-wide discovery on large panels, `engine='fast'` scans one GEMM per block
+against the projected dual of an exact null. It is calibrated with simulated null traits,
+so real signal cannot deflate it:
+
+```python
+from vigor import mvgwas_fast
+null = vigor.prepare_score_null(Y, K_loco, G, E)        # one per chromosome (LOCO kernel)
+state = mvgwas_fast.state_from_vigor_null(null, rank=10)
+scan = vigor.mvGWAS('genotypes/genotypes', engine='fast', state={'12': state}, chromosomes=['12'])
+scan.top_variants
+```
 
 ### Factor GWAS
 
@@ -163,13 +184,24 @@ leave-one-chromosome-out backgrounds:
 ```python
 gwas = vigor.factorGWAS(
     traits=Y, genotypes='genotypes/genotypes',      # PLINK 1 prefix
-    component='G', decomposition=fit, factors=20,
-    factor_method='native', loco_factor='fixed',    # test the fitted factors themselves
-    background='loco', method='exact', score_method='direct',
+    component='G', decomposition=fit, factors=20,   # test the fitted factors themselves
+    factor_method='native', background='loco',
     out='factor_gwas.zarr')
 ```
 
-`loco_factor='refit'` re-estimates the factors per chromosome group instead.
+How the default `method='grammar_gamma'` works:
+- **Scores.** Factor scores are exact: they come from the LOCO mvBLUP dual, and missing
+  cells are handled.
+- **Information.** It is x'x·S, with S rescaled per factor by γ. γ is the median ratio to
+  the exact information over about 200 strided variants per chromosome.
+- **Hits.** Variants passing `rescore_p` (default 1e-5) are rescored with the exact engine
+  and flagged in `exact_rescored`.
+- **Covariance.** G, E and the axes are estimated once, or taken from `decomposition`,
+  rather than refitted per chromosome.
+
+Other modes:
+- `method='exact'` scores every variant with the exact engine.
+- `loco_factor='refit'` re-estimates covariance and factors per chromosome group.
 
 ## Examples
 
@@ -181,7 +213,6 @@ gwas = vigor.factorGWAS(
 | [`examples/real26/`](examples/real26/MIGRATION.md) | full-cohort benchmark entrypoints (need a private 7,616-animal × 26-trait fixture) |
 | [`examples/quickstart.py`](examples/quickstart.py) | simulate a small PLINK dataset and run VIGOR end to end |
 | [`examples/compound_hyperopt.py`](examples/compound_hyperopt.py) | command-line `hyper_opt` run on your own kernel (`.npy`) and trait CSV |
-| `benchmarks/` | historical BLUP comparisons against GDEC 3.1.3 and rrBLUP, plus timing scripts |
 | [`comparators/`](comparators/README.md) | GDEC 3.1.3 and the rrBLUP/BGLR R driver used as benchmarks |
 
 The notebooks were checked against the 2.12.1 API but their outputs are cleared and
@@ -189,20 +220,13 @@ they were not re-executed for this release.
 
 ## Documentation
 
-- [docs/METHODS.md](docs/METHODS.md): estimands and methods
-- [docs/INPUT_OUTPUT.md](docs/INPUT_OUTPUT.md): inputs, outputs and association-scan fields
-- [docs/RESULTS_XARRAY.md](docs/RESULTS_XARRAY.md): working with result Datasets
-- [docs/H2_PRIOR.md](docs/H2_PRIOR.md): the empirical-Bayes h² prior, SEs and intervals
-- [docs/HYPER_OPT.md](docs/HYPER_OPT.md): the covariance hyperparameter search
-- [docs/PROGRESS.md](docs/PROGRESS.md): progress displays and fitting tolerances
-
-Every public function has a NumPy-style docstring (`help(vigor.genetic_varcov_PSD)`).
+Every public function has a NumPy-style docstring covering its estimand, inputs,
+outputs and cost, for example `help(vigor.genetic_varcov_PSD)`,
+`help(vigor.factorGWAS)` or `help(vigor.mvGWAS)`.
 
 ## Command line
 
-Installing VIGOR adds the `vigor` and `vigor-blup` commands (`vigor --help`). The
-`domino` package and `domino`/`domino-blup` commands remain as a compatibility alias
-for older code; new code should `import vigor`.
+Installing VIGOR adds the `vigor` and `vigor-blup` commands (`vigor --help`).
 
 ## Issues
 

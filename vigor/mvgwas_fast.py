@@ -23,7 +23,7 @@ from __future__ import annotations
 # Public scientific association entry points use vigor.gwas.exact exclusively.
 from .io import open_bed_memmap
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 import inspect
@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover
 
 __all__ = [
     "TraitScanBasis", "ScoreCalibration", "FastScoreState", "ScanResult",
-    "trait_scan_basis", "prepare_fast_score_state", "state_from_vigor_null", "calibrate_score_state",
+    "trait_scan_basis", "prepare_fast_score_state", "state_from_vigor_null", "null_trait_duals", "calibrate_score_state",
     "calibrate_xarray_score_state", "score_variant_block",
     "open_genotype_xarray", "scan_xarray", "scan_xarray_recombination", "scan_packed_bed",
     "prepare_packed_score_tables", "calibrate_packed_score_state", "score_packed_bed_block",
@@ -256,12 +256,19 @@ class FastScoreState:
     fit_mask : Optional[np.ndarray]
         Stored fit mask supplied by the corresponding fitting/planning routine. See that routine
         for the result-axis/value contract. Default: ``None``.
+
+    null_A : Optional[np.ndarray]
+        Basis-projected duals of simulated null traits, n x (reps * r), stacked by
+        replicate. Calibration estimates the score covariance M and lambda from
+        these, never from the real traits, so association signal cannot leak into
+        the calibration. Default: ``None`` (calibration then raises).
     """
     A: np.ndarray                    # n x r, float32
     basis: TraitScanBasis
     calibration: Optional[ScoreCalibration]
     trait_names: Tuple[str, ...]
     fit_mask: Optional[np.ndarray] = None
+    null_A: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -404,8 +411,13 @@ def prepare_fast_score_state(
     basis: str = "canonical",
     trait_names: Optional[Sequence[str]] = None,
     train_mask: Optional[np.ndarray] = None,
+    null_A: Optional[Any] = None,
 ) -> FastScoreState:
     """Project the exact n x T mvBLUP/LMM dual to r genetic axes.
+
+    ``null_A`` (reps x n x T, e.g. from :func:`null_trait_duals`) are duals of
+    simulated null traits under the same model; they are projected to the same
+    axes and used by every calibration routine.
 
     Parameters
     ----------
@@ -462,7 +474,17 @@ def prepare_fast_score_state(
             raise ValueError("train_mask has wrong shape")
         As = As.copy(); As[~fm] = 0.0
     names = tuple(map(str, trait_names)) if trait_names is not None else tuple(f"factor{i+1}" for i in range(As.shape[1]))
-    return FastScoreState(np.asarray(As, np.float32, order="C"), b, None, names, None if fm is None else fm.copy())
+    Nn = None
+    if null_A is not None:
+        N0 = np.asarray(null_A, np.float64)
+        N0 = N0[None] if N0.ndim == 2 else N0
+        if N0.ndim != 3 or N0.shape[1:] != A.shape:
+            raise ValueError("null_A must be reps x n x traits and match dual_A")
+        Nn = np.concatenate([a @ b.vectors for a in N0], axis=1)
+        if fm is not None:
+            Nn[~fm] = 0.0
+        Nn = np.asarray(Nn, np.float32, order="C")
+    return FastScoreState(np.asarray(As, np.float32, order="C"), b, None, names, None if fm is None else fm.copy(), Nn)
 
 
 def _score_components_missing(X: np.ndarray, A: np.ndarray, fit_mask: Optional[np.ndarray]):
@@ -562,34 +584,85 @@ def _score_components(X: np.ndarray, A: np.ndarray, fit_mask: Optional[np.ndarra
     return _score_components_missing(X, A, fit)
 
 
-def _robust_score_covariance(U: np.ndarray, ss: np.ndarray) -> np.ndarray:
-    """Estimate and stabilize multivariate null-score covariance from calibration variants.
+def _null_view(state: FastScoreState) -> FastScoreState:
+    """The state with its null-trait duals in place of the real dual (for calibration scores)."""
+    if state.null_A is None:
+        raise ValueError("score state has no null-trait duals: build it with state_from_vigor_null(...) "
+                         "or prepare_fast_score_state(..., null_A=null_trait_duals(null))")
+    return FastScoreState(state.null_A, state.basis, None, state.trait_names, state.fit_mask)
+
+
+def _calibration_from_null(U0: np.ndarray, ss: np.ndarray, rank_r: int, lambda_gc: bool = True) -> ScoreCalibration:
+    """Score covariance M and lambda from null-trait scores on the calibration variants.
+
+    U0 holds X'A0 for every replicate (m x reps*r); with Z0 = U0 / sqrt(ss),
+    M = E[Z0 Z0'] over variants and replicates (null scores have mean zero) and
+    lambda = median(Z0' M^-1 Z0) / chi2_r median. Both use only simulated null
+    traits, so real association signal on the calibration variants cannot
+    deflate the statistics.
+    """
+    good = np.isfinite(ss) & (ss > 0) & np.all(np.isfinite(U0), axis=1)
+    reps = max(1, U0.shape[1] // int(rank_r))
+    Z = (U0[good].reshape(-1, reps, rank_r) / np.sqrt(ss[good])[:, None, None]).reshape(-1, rank_r)
+    M = _project_psd(Z.T @ Z / len(Z)) if len(Z) > 1 else np.eye(rank_r)
+    Mi = np.linalg.pinv(M, rcond=1e-10)
+    rank = max(1, int(np.linalg.matrix_rank(M)))
+    Q = np.einsum("ij,jk,ik->i", Z, Mi, Z, optimize=True)
+    med0 = float(chi2.ppf(.5, rank))
+    lam = max(float(np.median(Q) / med0), 1e-6) if lambda_gc and len(Q) and med0 > 0 else 1.0
+    return ScoreCalibration(M, Mi, rank, lam, int(good.sum()))
+
+
+def _cholesky_jitter(M: np.ndarray, jitter: float = 1e-6) -> np.ndarray:
+    """Lower Cholesky factor of a PSD matrix, adding jitter * mean(diag) until it succeeds."""
+    from scipy.linalg import cholesky
+    M = _sym(np.asarray(M, np.float64))
+    scale = max(float(np.mean(np.diag(M))), np.finfo(float).tiny)
+    eye = np.eye(len(M))
+    for k in range(6):
+        try:
+            return cholesky(M + jitter * (10 ** k) * scale * eye, lower=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            continue
+    raise np.linalg.LinAlgError("matrix is not positive semidefinite within jitter")
+
+
+def null_trait_duals(null: Any, *, reps: int = 4, seed: int = 0, jitter: float = 1e-6) -> np.ndarray:
+    """Duals P y0 of simulated null traits under an exact score null (reps x n x t).
+
+    y0 ~ N(0, sum_c K_c (x) G_c + I (x) E) is drawn with Cholesky factors
+    (K = L L' with jitter; no eigendecomposition), restricted to the null's
+    observed cells and projected with the same fixed effects and V as the real
+    traits. One covariance solve per replicate.
 
     Parameters
     ----------
-    U : np.ndarray
-        Numerical operand in ``np.isfinite(ss) & (ss > 0) & np.all(np.isfinite(U), axis=1)``.
-        Shape must conform to that matrix/vector operation and the enclosing prepared state.
-        Source comparisons: ``r == 1``. See the rejection/fallback branches for enforcement.
-
-    ss : np.ndarray
-        Input for the operation ``np.isfinite(ss) & (ss > 0) & np.all(np.isfinite(U), axis=1)``.
-        See ``vigor.mvgwas_fast._robust_score_covariance`` and its caller for the scientific
-        representation; the shown operation constrains the required type/shape. Source
-        comparisons: ``ss > 0``. See the rejection/fallback branches for enforcement.
+    null : vigor.gwas.exact.ExactScoreNull
+        Null prepared with dense kernels (``prepare_score_null``).
+    reps : int
+        Independent null trait sets; 4 keeps lambda within a few percent.
+    seed : int
+        Random seed for the draws.
+    jitter : float
+        Relative diagonal jitter for the Cholesky factors.
     """
-    good = np.isfinite(ss) & (ss > 0) & np.all(np.isfinite(U), axis=1)
-    r = int(U.shape[1])
-    if good.sum() <= 1:
-        return np.eye(r)
-    Z = U[good] / np.sqrt(ss[good])[:, None]
-    if len(Z) > 20:
-        norm = np.einsum("ij,ij->i", Z, Z, optimize=True)
-        Z = Z[norm <= np.quantile(norm, .98)]
-    if r == 1:
-        v = float(np.var(Z[:, 0], ddof=1)) if len(Z) > 1 else 1.0
-        return np.array([[max(v, 1e-10)]], dtype=np.float64)
-    return _project_psd(np.cov(Z, rowvar=False, ddof=1) if len(Z) > 1 else np.eye(r))
+    rng = np.random.default_rng(seed)
+    n, t = null.y.shape
+    roots = []
+    for name, kernel in null.kernels.items():
+        if kernel.dense is None:
+            raise ValueError("null-trait calibration needs dense kernels")
+        roots.append((_cholesky_jitter(kernel.dense, jitter), _cholesky_jitter(null.covariances[name], jitter)))
+    Er = _cholesky_jitter(null.residual + null.jitter * np.eye(t), jitter)
+    out = np.zeros((int(reps), n, t))
+    for k in range(int(reps)):
+        y0 = rng.standard_normal((n, t)) @ Er.T
+        for Lk, Lg in roots:
+            y0 += Lk @ rng.standard_normal((n, t)) @ Lg.T
+        flat = np.zeros(n * t)
+        flat[null.observed] = null.project(y0.ravel()[null.observed])
+        out[k] = flat.reshape(n, t)
+    return out
 
 
 def calibrate_score_state(state: FastScoreState, calibration_genotypes: Any, *, lambda_gc: bool = True) -> FastScoreState:
@@ -617,16 +690,8 @@ def calibrate_score_state(state: FastScoreState, calibration_genotypes: Any, *, 
         Computed result from ``FastScoreState(state.A, state.basis, ScoreCalibration(M, Mi, rank, lam, int(len(q))), state.trait_names, state.fit_mask)``; see the summary and the called implementation for its labeled/numerical representation.
     """
     X = _to_numpy(calibration_genotypes, np.float32)
-    U, ss, _ = _score_components(X, state.A, state.fit_mask)
-    M = _robust_score_covariance(U, ss)
-    Mi = np.linalg.pinv(M, rcond=1e-10)
-    rank = max(1, int(np.linalg.matrix_rank(M)))
-    Z = np.divide(U, np.sqrt(ss)[:, None], out=np.zeros_like(U), where=np.sqrt(ss)[:, None] > 0)
-    Q = np.einsum("ij,jk,ik->i", Z, Mi, Z, optimize=True)
-    q = Q[np.isfinite(Q) & np.isfinite(ss) & (ss > 0)]
-    med0 = float(chi2.ppf(.5, rank))
-    lam = max(float(np.median(q) / med0), 1e-6) if lambda_gc and len(q) and med0 > 0 else 1.0
-    return FastScoreState(state.A, state.basis, ScoreCalibration(M, Mi, rank, lam, int(len(q))), state.trait_names, state.fit_mask)
+    U0, ss, _ = _score_components(X, _null_view(state).A, state.fit_mask)
+    return _replace(state, calibration=_calibration_from_null(U0, ss, state.A.shape[1], lambda_gc))
 
 
 def score_variant_block(X: Any, state: FastScoreState, *, return_factor_z: bool = False, assume_complete: bool = False) -> Dict[str, np.ndarray]:
@@ -755,15 +820,22 @@ def open_genotype_xarray(
     budget = working_memory_bytes(maxmem, memory_fraction, workers)
     requested = 'auto' if automatic else int(io_chunk_variants)
     xr = _require_xarray()
+    if isinstance(genotypes, (str, Path)) and (str(genotypes).rstrip("/\\").endswith(".zarr")
+                                               or (Path(genotypes).is_dir() and (Path(genotypes) / "zarr.json").exists())):
+        # VIGOR Zarr genotype store: canonical lazy sample x variant view, no PLINK reader.
+        from .data_model import open_genotype_dataset
+        genotypes = open_genotype_dataset(str(genotypes), source_format="zarr", maxmem=maxmem,
+                                          memory_fraction=memory_fraction)
     if isinstance(genotypes, xr.DataArray):
         g = genotypes
     elif isinstance(genotypes, xr.Dataset):
-        if "genotypes" in genotypes:
-            g = genotypes["genotypes"]
+        name = next((v for v in ("genotypes", "GT", "dosage", "DS") if v in genotypes.data_vars), None)
+        if name is not None:
+            g = genotypes[name]
         elif len(genotypes.data_vars) == 1:
             g = genotypes[next(iter(genotypes.data_vars))]
         else:
-            raise ValueError("genotype Dataset must contain one genotype variable")
+            raise ValueError("genotype Dataset must contain one genotype variable (genotypes, GT, dosage or DS)")
     elif isinstance(genotypes, (str, Path)):
         if npplink_module is None:
             try:
@@ -821,8 +893,9 @@ def open_genotype_xarray(
             raise RuntimeError(f"no npplink xarray reader could open {src!r}") from last
     else:
         raise TypeError("genotypes must be xarray or PLINK/PGEN path")
+    g = _canonical_genotype_view(g)
     if "iid" not in g.dims or "snp" not in g.dims:
-        raise ValueError("genotype xarray must use iid and snp dimensions")
+        raise ValueError("genotype xarray must use iid/snp or sample/variant dimensions")
     if not isinstance(genotypes, (str, Path)):
         io_chunk_variants = bounded_variant_chunk(
             g.sizes['iid'], requested=requested, maxmem=budget,
@@ -840,6 +913,32 @@ def open_genotype_xarray(
     g.attrs = dict(g.attrs, io_chunk_variants=int(io_chunk_variants),
                    io_chunk_policy='memory_auto' if automatic else 'memory_bounded_explicit',
                    io_memory_budget_bytes=budget)
+    return g
+
+
+def _canonical_genotype_view(g):
+    """iid/snp dimensions, chrom/pos coordinates and object-string labels for any genotype view.
+
+    Accepts the VIGOR Zarr/data-model names (sample, variant, chromosome,
+    position, variant_id) as well as npplink's (iid, snp, chrom, pos). Zarr v3
+    StringDType/bytes coordinates become object str arrays. Only coordinate
+    metadata is touched; genotype values stay lazy.
+    """
+    rename = {d: a for d, a in (("sample", "iid"), ("variant", "snp")) if d in g.dims and a not in g.dims}
+    if rename:
+        g = g.rename(rename)
+    extra = {}
+    for src, dst in (("chromosome", "chrom"), ("position", "pos")):
+        if src in g.coords and dst not in g.coords:
+            extra[dst] = (g.coords[src].dims, g.coords[src].values)
+    if "variant_id" in g.coords and g.coords["variant_id"].dims == ("snp",):
+        extra["snp"] = g.coords["variant_id"].values
+    if extra:
+        g = g.assign_coords(extra)
+    for name in list(g.coords):
+        values = np.asarray(g.coords[name].values)
+        if values.dtype.kind in "OSUT" or "String" in type(values.dtype).__name__:
+            g = g.assign_coords({name: (g.coords[name].dims, np.array([str(v) for v in values], dtype=object))})
     return g
 
 
@@ -1289,26 +1388,19 @@ def calibrate_xarray_score_state(
     else:
         idx=np.arange(g.sizes["snp"],dtype=np.int64); _io=int(g.attrs.get("io_chunk_variants", g.variable._data.chunks[1][0] if getattr(g.variable._data,"chunks",None) else 16384)); ci=_chrom_calibration_indices(idx,int(n_calibration),_io,int(calibration_io_windows))
     block = g.isel(snp=ci)
-    packed=_packed_bed_score_components_xarray(block,state)
+    nv = _null_view(state)
+    r = state.A.shape[1]
+    packed=_packed_bed_score_components_xarray(block,nv)
     if packed is not None:
-        U,ss,_=packed
-        M=_robust_score_covariance(U,ss);Mi=np.linalg.pinv(M,rcond=1e-10);rank=max(1,int(np.linalg.matrix_rank(M)))
-        Z=np.divide(U,np.sqrt(ss)[:,None],out=np.zeros_like(U),where=np.sqrt(ss)[:,None]>0);Q=np.einsum("ij,jk,ik->i",Z,Mi,Z,optimize=True)
-        q = Q[np.isfinite(Q) & np.isfinite(ss) & (ss > 0)];med0=float(chi2.ppf(.5,rank));lam=max(float(np.median(q)/med0),1e-6) if len(q) and med0>0 else 1.0
-        return FastScoreState(state.A,state.basis,ScoreCalibration(M,Mi,rank,lam,int(len(q))),state.trait_names,state.fit_mask)
+        U0,ss,_=packed
+        return _replace(state, calibration=_calibration_from_null(U0, ss, r))
     complete=(block.attrs.get("genotype_complete",None) is True) if isinstance(assume_complete,str) and assume_complete.lower()=="auto" else bool(assume_complete)
     if complete:
-        U, ss, _ = _xarray_score_components_complete(block, state)
-        M = _robust_score_covariance(U, ss);Mi = np.linalg.pinv(M, rcond=1e-10);rank = max(1, int(np.linalg.matrix_rank(M)))
-        Z = np.divide(U, np.sqrt(ss)[:, None], out=np.zeros_like(U), where=np.sqrt(ss)[:, None] > 0);Q = np.einsum("ij,jk,ik->i", Z, Mi, Z, optimize=True)
-        q = Q[np.isfinite(Q) & np.isfinite(ss) & (ss > 0)]; med0 = float(chi2.ppf(.5, rank));lam = max(float(np.median(q) / med0), 1e-6) if len(q) and med0 > 0 else 1.0
-        return FastScoreState(state.A, state.basis, ScoreCalibration(M, Mi, rank, lam, int(len(q))), state.trait_names, state.fit_mask)
+        U0, ss, _ = _xarray_score_components_complete(block, nv)
+        return _replace(state, calibration=_calibration_from_null(U0, ss, r))
     if isinstance(assume_complete,str) and assume_complete.lower()=="auto":
-        U,ss,_=_xarray_score_components_missing(block,state)
-        M=_robust_score_covariance(U,ss);Mi=np.linalg.pinv(M,rcond=1e-10);rank=max(1,int(np.linalg.matrix_rank(M)))
-        Z=np.divide(U,np.sqrt(ss)[:,None],out=np.zeros_like(U),where=np.sqrt(ss)[:,None]>0);Q=np.einsum("ij,jk,ik->i",Z,Mi,Z,optimize=True)
-        q = Q[np.isfinite(Q) & np.isfinite(ss) & (ss > 0)];med0=float(chi2.ppf(.5,rank));lam=max(float(np.median(q)/med0),1e-6) if len(q) and med0>0 else 1.0
-        return FastScoreState(state.A,state.basis,ScoreCalibration(M,Mi,rank,lam,int(len(q))),state.trait_names,state.fit_mask)
+        U0,ss,_=_xarray_score_components_missing(block,nv)
+        return _replace(state, calibration=_calibration_from_null(U0, ss, r))
     return calibrate_score_state(state, _xarray_compute(block, np.float32))
 
 
@@ -2293,61 +2385,49 @@ def open_scan_zarr3(path, chromosomes=None):
     return out
 
 
-def state_from_vigor_null(null: Mapping[str,Any], G: Any, E: Any, *, rank: int=10, basis: str="canonical", trait_names: Optional[Sequence[str]]=None, train_mask: Optional[np.ndarray]=None) -> FastScoreState:
-    """Build a compact scan state from VIGOR's exact multivariate null.
+def state_from_vigor_null(null: Any, G: Any = None, E: Any = None, *, rank: int = 10, basis: str = "canonical",
+                          trait_names: Optional[Sequence[str]] = None, train_mask: Optional[np.ndarray] = None,
+                          null_reps: int = 4, seed: int = 0) -> FastScoreState:
+    """Build a calibrated-ready scan state from an exact VIGOR score null.
 
-    ``null`` is the result of VIGOR's ``_prepare_mv_score_null`` and must
-    expose its exact observed-space dual as ``null['A']``.  This keeps the
-    fast scanner statistically tied to the same LOCO mixed-model null.
+    ``null`` comes from :func:`vigor.gwas.exact.prepare_score_null` (use the
+    LOCO kernel of the scanned chromosome). Its dual ``null.dual`` (P y,
+    animals x traits) is projected to ``rank`` genetic axes, and ``null_reps``
+    simulated null trait sets under the same model provide the calibration
+    duals (:func:`null_trait_duals`).
 
     Parameters
     ----------
-    null : Mapping[str, Any]
-        Previously prepared model/result or solver state consumed by this operation. Use the
-        object returned by the corresponding fitting/preparation routine with the same animal
-        and trait axes.
-
-    G : Any
-        Genetic trait covariance, in the same trait order as the observations; a dense matrix is
-        n_traits × n_traits. Multi-kernel prediction accepts matching named components or the
-        covariance-fit result.
-
-    E : Any
-        Residual trait covariance in observation-column order, including cross-trait residual
-        dependence. Prediction can recover this component from a covariance-fit result when None
-        is supplied; a separate genetic matrix requires an explicit compatible residual
-        covariance.
-
+    null : ExactScoreNull
+        Prepared exact null with dense kernels.
+    G, E : array-like, optional
+        Trait covariances defining the scan axes; default the null's total
+        genetic covariance and its residual covariance.
     rank : int
-        Retained matrix/factor rank. Integer ranks must be compatible with the relevant animal
-        or trait dimension. Full and automatic policies depend on the decomposition; see the
-        rank resolver used by this routine. Default: ``10``. Passed to
-        ``prepare_fast_score_state`` as ``rank``.
-
+        Number of scan axes. Default 10.
     basis : str
-        Trait/feature × retained-factor loading matrix or prepared basis. Column order
-        identifies factor directions and must agree with the scores used for projection.
-        Default: ``'canonical'``. Passed to ``prepare_fast_score_state`` as ``basis``.
-
-    trait_names : Optional[Sequence[str]]
-        Trait labels in matrix-column order, used to label or align the resulting trait
-        quantities. Default: ``None``. None delegates to the local fallback shown in this body;
-        it is not an additional numeric/category value. Passed to ``prepare_fast_score_state``
-        as ``trait_names``.
-
-    train_mask : Optional[np.ndarray]
-        Mask selecting training animals for fitting frequencies, scaling or model parameters.
-        Length must equal the animal axis; None uses the routine's full eligible training set.
-        Keep evaluation outcomes outside this mask. Default: ``None``. Passed to
-        ``prepare_fast_score_state`` as ``train_mask``.
-
-    Returns
-    -------
-    object
-        Computed result from ``prepare_fast_score_state(null['A'], G, E, rank=rank, basis=basis, trait_names=trait_names, train_mask=train_mask)``; see the summary and the called implementation for its labeled/numerical representation.
+        Axis construction passed to :func:`trait_scan_basis` ('canonical',
+        'genetic' or 'full').
+    trait_names : sequence of str, optional
+        Labels for the scan axes.
+    train_mask : bool array, optional
+        Animals contributing to the scores.
+    null_reps : int
+        Null trait sets for calibration (0 disables; the state then cannot be
+        calibrated).
+    seed : int
+        Seed for the null draws.
     """
-    if "A" not in null: raise ValueError("VIGOR null must contain dual matrix 'A'")
-    return prepare_fast_score_state(null["A"],G,E,rank=rank,basis=basis,trait_names=trait_names,train_mask=train_mask)
+    from .gwas.exact import ExactScoreNull
+    if not isinstance(null, ExactScoreNull):
+        raise TypeError("null must be an ExactScoreNull from vigor.gwas.exact.prepare_score_null")
+    if G is None:
+        G = sum(np.asarray(v, np.float64) for v in null.covariances.values())
+    if E is None:
+        E = null.residual
+    duals = null_trait_duals(null, reps=null_reps, seed=seed) if null_reps else None
+    return prepare_fast_score_state(null.dual, G, E, rank=rank, basis=basis, trait_names=trait_names,
+                                    train_mask=train_mask, null_A=duals)
 
 
 def _resolve_score_state(state: Any, chromosome: str) -> FastScoreState:
@@ -2891,6 +2971,12 @@ def scan_xarray_recombination(
     from .resources import resolve_variant_chunk, usable_cpu_count, working_memory_bytes
     xr=_require_xarray()
     g=open_genotype_xarray(genotypes,npplink_module=npplink_module,io_chunk_variants=io_chunk_variants,dtype=np.float32,use_memmap=True,sample_ids=sample_ids,maxmem=maxmem,memory_fraction=memory_fraction);g=_align_samples(g,sample_ids)
+    global_index=np.arange(g.sizes["snp"],dtype=np.int64)  # genome-wide variant positions reported in outputs
+    if chromosomes is not None and "chrom" in g.coords:
+        # Restrict the lazy view to the requested chromosomes before any rechunk or compute;
+        # a genome-wide graph is never built for a per-chromosome scan.
+        global_index=np.flatnonzero(np.isin(np.asarray(g.coords["chrom"].values).astype(str),[str(c) for c in chromosomes]))
+        _attrs=dict(g.attrs);g=g.isel(snp=global_index);g.attrs=_attrs
     io_chunk=int(g.attrs["io_chunk_variants"]);n_iid=int(g.sizes["iid"])
     _packed_direct=(str(g.attrs.get("physical_backend",""))=="plink1_bed_2bit" and "variant_index" in g.coords and "sample_index" in g.coords)
     # Score scratch per call: float32 decode + float32 missing mask + filled copy + squared temp + finiteness bool ~ 20 B.
@@ -2914,7 +3000,7 @@ def scan_xarray_recombination(
         if not len(idx): continue
         base_state=_resolve_score_state(state,cc)
         if g.sizes["iid"]!=base_state.A.shape[0]:raise ValueError(f"score state rows do not match genotype samples for chromosome {cc}")
-        cstate=calibrate_xarray_score_state(g,FastScoreState(base_state.A,base_state.basis,None,base_state.trait_names,base_state.fit_mask),chromosomes=[cc],sample_ids=None,n_calibration=calibration_n,io_chunk_variants=io_chunk,calibration_io_windows=calibration_io_windows,assume_complete=assume_complete,maxmem=maxmem,memory_fraction=memory_fraction)
+        cstate=calibrate_xarray_score_state(g,_replace(base_state,calibration=None),chromosomes=[cc],sample_ids=None,n_calibration=calibration_n,io_chunk_variants=io_chunk,calibration_io_windows=calibration_io_windows,assume_complete=assume_complete,maxmem=maxmem,memory_fraction=memory_fraction)
         calibrated_states[str(cc)]=cstate;factor_ranks[str(cc)]=int(cstate.A.shape[1])
         names=[];poss=[];cms=[];vidxs=[];stats=[];ps=[];nlps=[];nobss=[];fzs=[]
         chunk_ids=[idx[a0:a0+score_chunk] for a0 in range(0,len(idx),score_chunk)]
@@ -2952,7 +3038,7 @@ def scan_xarray_recombination(
                 if progress_callback is not None:progress_callback({"phase":"score_chunk","chromosome":cc,"processed_variants":nscan+local_scanned,"total_variants":total_variants,"chromosome_processed":local_scanned,"chromosome_total":len(idx)})
                 stats.append(z["stat"]);ps.append(z["p"]);nlps.append(z["neglog_p"]);nobss.append(z["nobs"])
                 if return_factor_z:fzs.append(z["factor_z"])
-                names.append(names_all[gi]);poss.append(pos_all[gi]);vidxs.append(gi)
+                names.append(names_all[gi]);poss.append(pos_all[gi]);vidxs.append(global_index[gi])
                 if cm_all is not None:cms.append(cm_all[gi])
         finally:
             if workers>1:
@@ -2971,7 +3057,7 @@ def scan_xarray_recombination(
             budget=max(0,int(exact_rescore_top)-len(lead_local));pp=np.asarray(ds["omnibus_p"].values,float);extra=extra[np.argsort(pp[extra])[:budget]] if len(extra) else extra
         cand=np.unique(np.r_[lead_local,extra])
         if exact_rescore_fn is not None and len(cand):
-            gi=np.asarray(ds["variant_index"].values,np.int64)[cand];Xex=_xarray_compute(g.isel(snp=gi),np.float32);ex=exact_rescore_fn(Xex,np.asarray(ds["snp"].values).astype(str)[cand],np.asarray(ds["pos"].values,np.int64)[cand],gi,chromosome=str(cc));ds=_merge_exact(ds,ex)
+            gi=np.asarray(ds["variant_index"].values,np.int64)[cand];Xex=_xarray_compute(g.isel(snp=np.searchsorted(global_index,gi)),np.float32);ex=exact_rescore_fn(Xex,np.asarray(ds["snp"].values).astype(str)[cand],np.asarray(ds["pos"].values,np.int64)[cand],gi,chromosome=str(cc));ds=_merge_exact(ds,ex)
         top=_top_variants(ds,top_k,keep_p);regions=candidate_regions_from_scan(top,lead_p=region_p_threshold,padding_bp=region_padding_bp,recombination_rate_cM_per_mb=region_recombination_rate_cM_per_mb,merge_recombination_cM=region_merge_recombination_cM,max_regions=None,fallback_top_k=region_fallback_top_k)
         if top.sizes.get("variant",0): top_parts.append(top)
         if regions.sizes.get("region",0): region_parts.append(regions)
@@ -3184,12 +3270,9 @@ def calibrate_packed_score_state(prefix, state, tables=None, *, chromosome=None,
     else:
         ci=idx[np.unique(np.linspace(0,len(idx)-1,int(n_calibration),dtype=np.int64))]
     if tables is None: tables=prepare_packed_score_tables(state,prefix,sample_ids=sample_ids,precision=precision)
-    U,ss,_=packed_score_components_fast(np.asarray(mm[ci],np.uint8),tables)
-    M=_robust_score_covariance(U,ss); Mi=np.linalg.pinv(M,rcond=1e-10); rank=max(1,int(np.linalg.matrix_rank(M)))
-    root=np.sqrt(ss); Z=np.divide(U,root[:,None],out=np.zeros_like(U),where=root[:,None]>0)
-    Q=np.einsum('ij,jk,ik->i',Z,Mi,Z,optimize=True); q = Q[np.isfinite(Q) & np.isfinite(ss) & (ss > 0)]; med0=float(chi2.ppf(.5,rank))
-    lam=max(float(np.median(q)/med0),1e-6) if len(q) and med0>0 else 1.0
-    return FastScoreState(state.A,state.basis,ScoreCalibration(M,Mi,rank,lam,int(len(q))),state.trait_names,state.fit_mask),tables
+    null_tables=prepare_packed_score_tables(_null_view(state),prefix,sample_ids=sample_ids,precision=precision)
+    U0,ss,_=packed_score_components_fast(np.asarray(mm[ci],np.uint8),null_tables)
+    return _replace(state,calibration=_calibration_from_null(U0,ss,state.A.shape[1])),tables
 
 def scan_packed_bed(prefix, state, *, chromosomes=None, sample_ids=None, score_chunk_variants='auto',
                     calibration_n=4096, calibration_io_windows=4, precision='exact', min_maf=None, top_k=10000,
@@ -3344,7 +3427,7 @@ def scan_packed_bed(prefix, state, *, chromosomes=None, sample_ids=None, score_c
         idx=np.flatnonzero(chrom_all==str(cc))
         if not len(idx): continue
         base=_resolve_score_state(state,cc)
-        cstate,tables=calibrate_packed_score_state(prefix,FastScoreState(base.A,base.basis,None,base.trait_names,base.fit_mask),
+        cstate,tables=calibrate_packed_score_state(prefix,_replace(base,calibration=None),
             chromosome=cc,sample_ids=sample_ids,n_calibration=calibration_n,
             io_chunk_variants=score_chunk_variants,calibration_io_windows=calibration_io_windows,precision=precision)
         calibrated_states[str(cc)]=cstate; factor_ranks[str(cc)]=int(cstate.A.shape[1])

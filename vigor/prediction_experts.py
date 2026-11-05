@@ -139,6 +139,82 @@ def _conditional_mean(traits, GRM, G, E=None, *, solver_tol=1e-7,
         preconditioner=preconditioner)['phenotype_prediction'])
 
 
+def _expert_kernels(GRM, kernel_dtype=np.float32):
+    """Cast dense relationship kernels once to the expert working dtype (float32 by default).
+
+    Cross-fit folds call covariance and mvBLUP solvers repeatedly; a float32 kernel avoids a
+    per-call float64->float32 operator copy in the fast solver and halves the resident kernel.
+    Kernel operators and non-float inputs are returned unchanged.
+
+    Parameters
+    ----------
+    GRM : array-like, pandas.DataFrame, kernel operator or mapping
+        Relationship kernel(s) in animal order; mappings are cast entry by entry.
+    kernel_dtype : NumPy dtype, str or None
+        Target floating dtype; None keeps the caller's kernel unchanged. Default: ``np.float32``.
+    """
+    if kernel_dtype is None: return GRM
+    dt=np.dtype(kernel_dtype)
+    def one(K):
+        """Cast one dense floating kernel to ``dt`` without copying when already ``dt``."""
+        if isinstance(K,pd.DataFrame) and len(K.columns) and all(np.dtype(d).kind=='f' for d in K.dtypes):
+            return K if all(np.dtype(d)==dt for d in K.dtypes) else K.astype(dt)
+        if isinstance(K,np.ndarray) and K.ndim==2 and K.dtype.kind=='f':
+            return K if K.dtype==dt else K.astype(dt)
+        return K
+    return {k:one(v) for k,v in GRM.items()} if isinstance(GRM,dict) else one(GRM)
+
+
+def _check_genomic_width(genomic_features, max_genomic_features):
+    """Reject genome-wide dense feature panels before cross-fitting copies them per fold and trait.
+
+    Parameters
+    ----------
+    genomic_features : pandas.DataFrame, array-like or None
+        Expert genomic feature matrix (animals × features).
+    max_genomic_features : int or None
+        Largest accepted feature count; None disables the guard.
+    """
+    if genomic_features is None or max_genomic_features is None: return
+    gf=_compat._genomic_features_input(genomic_features)
+    shape=tuple(getattr(gf,'shape',None) or np.shape(gf))
+    p=int(shape[1]) if len(shape)==2 else 0
+    if p>int(max_genomic_features):
+        raise ValueError(
+            f"genomic_features has {p} columns (> max_genomic_features={int(max_genomic_features)}); "
+            "cross-fitted experts would build several dense N x p copies. Pre-screen SNPs with "
+            "make_genomic_features(..., snp_top_k=k, screen_traits=<training phenotypes>, fit_mask=<training rows>) "
+            "or pass an explicit selected_snps list; raise max_genomic_features only if memory allows.")
+
+
+def _marginal_screen_scores(C, R):
+    """Training-only marginal SNP screen shared by screened ridge and ``make_genomic_features``.
+
+    Parameters
+    ----------
+    C : numpy.ndarray
+        Standardized candidate features on training rows (rows × p), with no missing values.
+    R : numpy.ndarray
+        Matching training targets/residuals (rows × t); NaN cells are ignored.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``|C' (R - mean)| / n_obs`` per candidate and trait (p × t); because candidates are
+        standardized, normalizing by observed count is enough for ranking.
+    """
+    mask=np.isfinite(R); cnt=mask.sum(0)
+    mu=np.divide(np.nansum(R,0),cnt,out=np.zeros(R.shape[1]),where=cnt>0)
+    Y0=np.where(mask,R-mu[None,:],0.0)
+    return np.abs(C.T@Y0)/np.maximum(cnt,1)[None,:]
+
+
+def _free_fold_memory():
+    """Release kernel-sized temporaries of the finished cross-fit fold before the next one starts."""
+    import gc
+    gc.collect()
+
+
 def _resolve_E(G, E):
     """Resolve E.
 
@@ -174,6 +250,7 @@ def fit_blup_residual_experts(
     covariance_kwargs=None, allow_blup_only_nonlinear=False, store_oof=False,
     fit_genomic_per_trait=True, fit_phenotype_per_trait=True, selection_cv=3,
     partial_baseline='genetic_mean',fit_multitask_genomic=True, save_path=None,
+    kernel_dtype="float32", max_genomic_features=20000,
 ):
     """Cross-fitted 3.1-style residual experts using the 2.12.1 covariance engine.
 
@@ -340,6 +417,17 @@ def fit_blup_residual_experts(
         Optional .zarr path; when given the result is written as consolidated, sharded Zarr v3
         and returned reopened lazily. Default: ``None``.
 
+    kernel_dtype : NumPy dtype, str or None
+        Working dtype of dense relationship kernels inside the experts. The kernel is cast once
+        (float32 halves the resident n x n kernel and avoids per-fold operator copies in the
+        fast solver; exact-accuracy calls still upcast internally). None keeps the caller's
+        kernel. Default: ``'float32'``.
+
+    max_genomic_features : int or None
+        Largest accepted ``genomic_features`` width. Wider (genome-wide) panels raise a
+        ValueError pointing to ``make_genomic_features(snp_top_k=...)`` instead of being
+        copied densely per fold and trait. None disables the guard. Default: ``20000``.
+
     Returns
     -------
     xarray.Dataset
@@ -355,6 +443,8 @@ def fit_blup_residual_experts(
     params = _call_parameters(fit_blup_residual_experts, locals())
     traits, GRM, G, E = _pandas(traits), _pandas(GRM), _pandas(G), _pandas(E)
     genomic_features = _pandas(genomic_features)
+    _check_genomic_width(genomic_features, max_genomic_features)
+    GRM = _expert_kernels(GRM, kernel_dtype)
     Y = traits.copy() if isinstance(traits, pd.DataFrame) else pd.DataFrame(traits)
     if partial_baseline not in {'genetic_mean','conditional'}:
         raise ValueError('partial_baseline must be genetic_mean or conditional')
@@ -445,6 +535,7 @@ def fit_blup_residual_experts(
             if len(rows):
                 gx[j].append(Xg[rows])
                 gy[j].append(Y.iloc[rows, j].to_numpy(float) - Bk.iloc[rows, j].to_numpy(float))
+        del Yk, Bk, Gk, Ek, Xg; _free_fold_memory()
 
     px = [[] for _ in range(t)]; py = [[] for _ in range(t)]
     cell_fold = None
@@ -463,6 +554,8 @@ def fit_blup_residual_experts(
                     )
                     px[j].append(Xp[rows])
                     py[j].append(Y.iloc[rows, j].to_numpy(float) - Pk.iloc[rows, j].to_numpy(float))
+                    del Xp
+            del Yk, Bk, Gk, Ek, Pk; _free_fold_memory()
 
     gx = [np.vstack(z) if z else None for z in gx]
     gy = [np.concatenate(z) if z else None for z in gy]
@@ -781,12 +874,8 @@ def _screened_ridge_fit_matrix(X, R, feature_names, *, top_k=256, alpha=100.0,
             pmean=P[tr].mean(0); psd=P[tr].std(0); psd=np.where(psd>1e-8,psd,1.0)
             Pt=(P[tr]-pmean)/psd; Pv=(P[va]-pmean)/psd
         else: Pt=np.zeros((len(tr),0)); Pv=np.zeros((len(va),0))
-        Rt=R[tr]; mask=np.isfinite(Rt); mu=np.divide(np.nansum(Rt,0),mask.sum(0),out=np.zeros(R.shape[1]),where=mask.sum(0)>0)
-        Y0=np.where(mask,Rt-mu[None,:],0.0)
-        # One BLAS-3 screen for all traits. Normalization by observed count is
-        # enough for ranking because candidate columns are standardized.
-        denom=np.maximum(mask.sum(0),1)
-        score=np.abs(Ct.T@Y0)/denom[None,:]
+        # One BLAS-3 screen for all traits on this fold's training residuals only.
+        Rt=R[tr]; score=_marginal_screen_scores(Ct,Rt)
         for j in range(R.shape[1]):
             obs=np.isfinite(Rt[:,j])
             if obs.sum()<10: continue
@@ -818,8 +907,7 @@ def _screened_ridge_fit_matrix(X, R, feature_names, *, top_k=256, alpha=100.0,
         pmean=P[rows].mean(0); psd=P[rows].std(0); psd=np.where(psd>1e-8,psd,1.0); Pt=(P[rows]-pmean)/psd
     else:
         pmean=psd=np.zeros(0); Pt=np.zeros((len(rows),0))
-    mask=np.isfinite(R[rows]); mu=np.divide(np.nansum(R[rows],0),mask.sum(0),out=np.zeros(R.shape[1]),where=mask.sum(0)>0)
-    Y0=np.where(mask,R[rows]-mu[None,:],0.0); score=np.abs(Ct.T@Y0)/np.maximum(mask.sum(0),1)[None,:]
+    mask=np.isfinite(R[rows]); score=_marginal_screen_scores(Ct,R[rows])
     models={}
     for j in range(R.shape[1]):
         obs=mask[:,j]
@@ -993,12 +1081,14 @@ def _nested_screened_genomic_fit(Y,GRM,G,E,feature,*,covariance_kwargs,refit,n_s
             n_splits=n_splits,random_state=random_state+1009*(k+1),genomic_features=genomic_features,
             crossfit_refit_covariance=refit,covariance_kwargs=kw,n_components=n_components,
             fit_genomic_per_trait=False,fit_phenotype_per_trait=False,fit_multitask_genomic=False,store_oof=True,
-            solver_tol=solver_tol,solver_maxiter=solver_maxiter,preconditioner=preconditioner)
+            solver_tol=solver_tol,solver_maxiter=solver_maxiter,preconditioner=preconditioner,
+            kernel_dtype=None,max_genomic_features=None)
         io=inner.attrs['oof']
         model=_screened_ridge_fit_matrix(io['genomic_feature_matrix'],io['genomic_residual_matrix'],
             feature['feature_names_genomic'],top_k=top_k,alpha=alpha,n_splits=selection_cv,
             random_state=random_state+7919+k,min_gain=min_gain,min_z=min_z)
         prediction[va]=_screened_ridge_predict(model,X[va],R.shape[1])
+        del masked,cov,base,inner,io,model; _free_fold_memory()
     valid=np.isfinite(R)&np.isfinite(prediction);gain,_=_compat._paired_rmse_gain(R[valid],np.zeros(valid.sum()),prediction[valid])
     improvement=np.where(valid,R**2-(R-prediction)**2,0.).sum(1);count=valid.sum(1);rows=count>0;d=improvement[rows]/count[rows]
     z=float(d.mean()/(d.std(ddof=1)/np.sqrt(len(d)))) if len(d)>1 and d.std()>0 else -np.inf
@@ -1028,6 +1118,7 @@ def fit_blup_prediction_experts(
     matrix_calibrate_oof=True, matrix_calibration_min_points=8,
     matrix_calibration_max_scale=1.0,
     partial_baseline='genetic_mean', save_path=None,
+    kernel_dtype="float32", max_genomic_features=20000,
     **feature_kwargs,
 ):
     """Fit target-specific residual experts around one mvBLUP model.
@@ -1218,6 +1309,15 @@ def fit_blup_prediction_experts(
         Optional .zarr path; when given the result is written as consolidated, sharded Zarr v3
         and returned reopened lazily. Default: ``None``.
 
+    kernel_dtype : NumPy dtype, str or None
+        Working dtype of dense relationship kernels for every expert (feature, screened and
+        matrix families); cast once on entry. None keeps the caller's kernel. Default: ``'float32'``.
+
+    max_genomic_features : int or None
+        Largest accepted ``genomic_features`` width; genome-wide panels raise a ValueError
+        pointing to ``make_genomic_features(snp_top_k=...)``. None disables the guard.
+        Default: ``20000``.
+
     **feature_kwargs : dict
         Input supplied to ``fit_blup_residual_experts`` as ``**expanded mapping``. See that
         callable's documented ``**expanded mapping`` contract for its type, alignment and value
@@ -1237,6 +1337,8 @@ def fit_blup_prediction_experts(
     params = _call_parameters(fit_blup_prediction_experts, locals())
     traits, GRM, G, E = _pandas(traits), _pandas(GRM), _pandas(G), _pandas(E)
     genomic_features = _pandas(genomic_features)
+    _check_genomic_width(genomic_features, max_genomic_features)
+    GRM = _expert_kernels(GRM, kernel_dtype)
     Y = traits.copy() if isinstance(traits, pd.DataFrame) else pd.DataFrame(traits)
     E_model = _resolve_E(G, E)
     B = _as_frame(blup, Y) if blup is not None else _as_frame(
@@ -1251,8 +1353,9 @@ def fit_blup_prediction_experts(
         fit_genomic_per_trait=(fit_genomic_per_trait and not screened),
         fit_phenotype_per_trait=fit_phenotype_per_trait, selection_cv=selection_cv,
         store_oof=screened, **feature_kwargs,
-        partial_baseline=partial_baseline,
+        partial_baseline=partial_baseline, kernel_dtype=None, max_genomic_features=None,
     )
+    _free_fold_memory()
     feature = _result_dict(feature_ds)
     screened_fit = None
     if screened:

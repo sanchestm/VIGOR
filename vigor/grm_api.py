@@ -49,6 +49,147 @@ def _prefix(source):
     return s
 
 
+def _is_xarray_source(source):
+    """Return True for a Zarr genotype store path, an xarray genotype object or an opened xarray source.
+
+    Parameters
+    ----------
+    source : object
+        Genotype input given to ``grm``/``GRMs``: a VIGOR Zarr store directory written by
+        ``write_genotype_zarr``, an ``xarray.Dataset``/``DataArray`` such as one returned by
+        ``open_genotype_dataset``, an opened ``XarrayGenotypeSource``, or a PLINK1 prefix.
+
+    Returns
+    -------
+    bool
+        Whether the input is routed through the bounded ``build_grms`` block reader.
+    """
+    if isinstance(source,(xr.Dataset,xr.DataArray)):return True
+    if hasattr(source,"iter_blocks") and hasattr(source,"ds"):return True
+    if isinstance(source,(str,os.PathLike)):
+        p=Path(str(source))
+        return p.is_dir() and (p.suffix==".zarr" or any((p/f).exists() for f in ("zarr.json",".zgroup",".zattrs")))
+    return False
+
+
+def _object_strings(a):
+    """Coerce identifiers (including Zarr v3 StringDType and bytes) to an object array of Python str.
+
+    Parameters
+    ----------
+    a : array-like
+        One-dimensional sample or variant labels read from a genotype store.
+
+    Returns
+    -------
+    numpy.ndarray
+        Object-dtype array of ``str`` with the input order preserved.
+    """
+    return np.array([v.decode() if isinstance(v,bytes) else str(v) for v in np.asarray(a).ravel()],dtype=object)
+
+
+def _coerce_string_coords(ds):
+    """Replace string-like 1-D sample/variant variables (StringDType, bytes, object) by object str arrays.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Canonical genotype Dataset with ``sample`` and ``variant`` dimensions.
+
+    Returns
+    -------
+    xarray.Dataset
+        Same Dataset with string coordinates/variables coerced; numeric arrays are untouched
+        and genotype arrays stay lazy.
+    """
+    co,dv={},{}
+    for name,v in ds.variables.items():
+        if v.ndim==1 and v.dims[0] in ("sample","variant") and v.dtype.kind in "TSO":
+            (co if name in ds.coords else dv)[name]=(v.dims,_object_strings(v.values))
+    if co:ds=ds.assign_coords(co)
+    if dv:ds=ds.assign(dv)
+    return ds
+
+
+def _open_xarray_genotypes(source):
+    """Open a Zarr/xarray genotype input as a lazy ``XarrayGenotypeSource`` without materialising calls.
+
+    Parameters
+    ----------
+    source : object
+        Zarr store path, ``xarray.Dataset``/``DataArray`` (dimensions ``sample``/``variant`` or
+        ``iid``/``snp``) or an already opened ``XarrayGenotypeSource``.
+
+    Returns
+    -------
+    tuple
+        ``(src, owned)`` where ``owned`` tells the caller to close ``src`` when finished.
+    """
+    from .genotype_source import XarrayGenotypeSource
+    if hasattr(source,"iter_blocks") and hasattr(source,"ds"):
+        return source,False
+    if isinstance(source,(xr.Dataset,xr.DataArray)):
+        dims={k:v for k,v in (("iid","sample"),("snp","variant")) if k in source.dims and v not in source.dims}
+        ds=source.rename(dims) if dims else source
+        if isinstance(ds,xr.DataArray):ds=ds.to_dataset(name="GT")
+        owned=False
+    else:
+        from .data_model import open_genotype_dataset
+        ds=open_genotype_dataset(str(source));owned=True
+    src=XarrayGenotypeSource(_coerce_string_coords(ds))
+    src.sample_ids=_object_strings(src.sample_ids).astype(str)
+    return src,owned
+
+
+def _xarray_sample_metadata(src, ids):
+    """Return FID and sex labels for requested animals from optional ``sample`` variables.
+
+    Parameters
+    ----------
+    src : XarrayGenotypeSource
+        Opened genotype source whose Dataset may carry ``fid``/``family_id`` and ``sex`` on ``sample``.
+    ids : numpy.ndarray
+        Requested animal identifiers in kernel order.
+
+    Returns
+    -------
+    tuple
+        ``(fid, sex)`` string arrays; FID defaults to IID and sex to ``'0'`` (unknown).
+    """
+    pos=pd.Index(np.asarray(src.sample_ids,dtype=str)).get_indexer(ids)
+    def pick(names, default):
+        for nm in names:
+            if nm in src.ds.variables and src.ds[nm].dims==("sample",):
+                v=np.asarray(src.ds[nm].values)[pos]
+                if v.dtype.kind in "iub":return v.astype(np.int64).astype(str)
+                if v.dtype.kind=="f":return np.where(np.isfinite(v),np.nan_to_num(v).astype(np.int64).astype(str),"0")
+                return _object_strings(v).astype(str)
+        return default
+    return (pick(("fid","family_id","FID"),np.asarray(ids,dtype=str)),
+            pick(("sex","SEX","sexes"),np.full(len(ids),"0")))
+
+
+class _ScaledDosageSource:
+    """Genotype-source view multiplying the dosage block rows of selected animals by fixed factors.
+
+    Used for confidently detected male-X 0/1 haploid coding on Zarr/xarray sources, mirroring
+    the PLINK ``dosage_scale`` path; every other attribute is forwarded to ``src``.
+    """
+    def __init__(self, src, scale_by_id):
+        """Store the wrapped source and the ``{IID: factor}`` mapping (absent IDs use 1)."""
+        self._src=src;self._scale=scale_by_id
+        self.sample_ids=src.sample_ids;self.variant_metadata=src.variant_metadata
+        self.maxmem=getattr(src,"maxmem",None);self.memory_fraction=getattr(src,"memory_fraction",None)
+
+    def iter_blocks(self, representation="dosage", samples=None, **kwargs):
+        """Yield the wrapped source's blocks with row-wise dosage factors applied."""
+        ids=np.asarray(self.sample_ids if samples is None else samples,dtype=str)
+        f=np.asarray([self._scale.get(x,1.) for x in ids],np.float32)[:,None]
+        for b in self._src.iter_blocks(representation,samples=samples,**kwargs):
+            b.data=np.asarray(b.data,np.float32)*f
+            yield b
+
+
 def _sample_selection(reader, sample_ids):
     """Inputs: reader, sample_ids.
         Outputs: relatedness kernels, aligned metadata, model diagnostics or persisted dataset as documented below.
@@ -153,6 +294,45 @@ def _detect_x_encoding(reader, sample_index, sexes, variant_index, max_variants=
     for _,X in reader.iter_blocks(block_size=256,variant_index=take,
                                   sample_index=np.asarray(sample_index)[male]):
         for i in range(3):observed[i]+=int(np.sum(np.asarray(X)==i))
+    return _classify_male_x_calls(observed)
+
+
+def _detect_x_encoding_source(src, ids, sexes, chrom, max_variants=10000):
+    """Zarr/xarray analogue of ``_detect_x_encoding`` reading bounded male blocks from ``src.iter_blocks``.
+
+    Parameters
+    ----------
+    src : XarrayGenotypeSource
+        Opened lazy genotype source.
+    ids : numpy.ndarray
+        Requested animal identifiers aligned with ``sexes``.
+    sexes : numpy.ndarray
+        Sex labels, where 1/M denotes male and 2/F female.
+    chrom : str
+        X chromosome label in the source variant metadata.
+    max_variants : int
+        Maximum number of leading chromosome variants examined. Default: ``10000``.
+
+    Returns
+    -------
+    str
+        Encoding status with the same vocabulary as ``_detect_x_encoding``.
+    """
+    sx=np.asarray(sexes).astype(str)
+    male=np.flatnonzero(np.isin(sx,["1","M","m"]));female=np.flatnonzero(np.isin(sx,["2","F","f"]))
+    m=int((src.variant_metadata.chromosome.astype(str)==str(chrom)).sum())
+    if len(male)<20 or len(female)<20 or m<100:
+        return "skipped_insufficient_samples"
+    observed=np.zeros(3,np.int64);seen=0
+    for b in src.iter_blocks(samples=np.asarray(ids,dtype=str)[male],chrom=str(chrom),block_size=256):
+        X=np.asarray(b.data)[:,:max_variants-seen];seen+=X.shape[1]
+        for i in range(3):observed[i]+=int(np.sum(X==i))
+        if seen>=max_variants:break
+    return _classify_male_x_calls(observed)
+
+
+def _classify_male_x_calls(observed):
+    """Classify male X coding from counts of 0/1/2 calls (shared by PLINK and Zarr paths)."""
     alt=int(observed[1]+observed[2])
     if alt<100:return "skipped_insufficient_alternate_calls"
     if observed[1]>0 and observed[2]>0:return "skipped_mixed_diploid_or_unclear"
@@ -263,9 +443,15 @@ def _grm_payload(source, chromosome, *, sample_ids=None, components=("additive",
     object
         Scientific matrix, metadata or xarray Dataset, preserving source sample and component coordinate alignment.
     """
+    method,components=validate_grm_method(method,components)
+    if _is_xarray_source(source):
+        return _grm_payload_xarray(source,chromosome,sample_ids=sample_ids,components=components,
+            method=method,fit_mask=fit_mask,min_maf=min_maf,block_size=block_size,
+            output_dtype=output_dtype,blas_threads=blas_threads,dosage_compensation=dosage_compensation,
+            n_autosomes=n_autosomes,engine=engine,progress=progress,
+            memory_fraction=memory_fraction,maxmem=maxmem)
     from .io import PlinkReader
     from .packed_bed import dense_grm_from_bed
-    method,components=validate_grm_method(method,components)
     prefix=_prefix(source)
     with PlinkReader(prefix,dtype=np.float32) as reader:
         sel,ids,fid,sexes=_sample_selection(reader,sample_ids)
@@ -294,6 +480,65 @@ def _grm_payload(source, chromosome, *, sample_ids=None, components=("additive",
         return kernels, weights, diag, ids, fid, sexes, dosage
 
 
+def _grm_payload_xarray(source, chromosome, *, sample_ids=None, components=("additive","dominance"),
+                        method="npplink", fit_mask=None, min_maf=1e-4, block_size='auto',
+                        output_dtype=np.float32, blas_threads='auto', dosage_compensation=False,
+                        n_autosomes=20, engine="auto", progress=False, memory_fraction=None, maxmem=None):
+    """Zarr/xarray counterpart of ``_grm_payload`` using the ``build_grms`` block reader.
+
+    Genotypes are read as bounded sample × variant blocks through
+    ``grm_store._compute_chromosome_grms`` (lazy Dask/Zarr slices, packed ``GT_packed2``
+    decoded per block), so the full genotype matrix is never materialised. The arithmetic is
+    the float-BLAS ``grm_from_blocks`` accumulator used for PLINK float engines; the packed
+    bitserial engine is PLINK-only. Parameters and return value match ``_grm_payload``.
+    """
+    from .grm_store import _compute_chromosome_grms
+    if str(engine).lower() not in {"auto","float","blas"}:
+        raise ValueError(f"engine={engine!r} requires PLINK1 BED; Zarr/xarray sources use the float-BLAS block reader (engine='auto')")
+    src,owned=_open_xarray_genotypes(source)
+    try:
+        source_ids=np.asarray(src.sample_ids,dtype=str)
+        ids=source_ids if sample_ids is None else _object_strings(sample_ids).astype(str)
+        if len(set(ids))!=len(ids):raise ValueError("sample_ids must be unique")
+        if len(set(source_ids))!=len(source_ids):raise ValueError("genotype sample IDs are not unique; subset requires unambiguous IDs")
+        if np.any(pd.Index(source_ids).get_indexer(ids)<0):
+            raise ValueError("sample_ids contains identifiers absent from the genotype store")
+        fid,sexes=_xarray_sample_metadata(src,ids)
+        chrom=str(chromosome)
+        m=int((src.variant_metadata.chromosome.astype(str)==chrom).sum())
+        if m==0:raise ValueError(f"chromosome {chrom!r} has no variants")
+        fit=np.ones(len(ids),bool) if fit_mask is None else np.asarray(fit_mask,bool)
+        if fit.shape!=(len(ids),) or not fit.any():
+            raise ValueError("fit_mask must be length sample_ids, with >=1 selected")
+        dosage="not_applicable"
+        if _chromosome_class(chrom,n_autosomes)=="X" and dosage_compensation:
+            dosage=_detect_x_encoding_source(src,ids,sexes,chrom)
+        reader=src
+        if dosage=='male_haploid_01_double':
+            male=np.isin(np.asarray(sexes).astype(str),['1','M','m'])
+            reader=_ScaledDosageSource(src,{x:2. for x in ids[male]})
+        out,diag=_compute_chromosome_grms(reader,chrom,sample_ids=ids,fit_mask=fit,include=components,
+            block_size=block_size,min_maf=min_maf,compute_dtype=np.float32,accum_dtype=np.float32,
+            blas_threads=blas_threads,progress=progress,maxmem=maxmem,
+            memory_fraction=memory_fraction,method=method)
+        kernels={c:np.asarray(out[c][0]) for c in components}
+        weights={c:out[c][1] for c in components}
+        return kernels,weights,diag,ids,fid,sexes,dosage
+    finally:
+        if owned and hasattr(src,"close"):src.close()
+
+
+def _source_description(genotypes):
+    """Return ``(source_location, genotype_source_type)`` attributes for a PLINK or Zarr/xarray input."""
+    if not _is_xarray_source(genotypes):
+        return str(Path(_prefix(genotypes)).resolve()),"PLINK1_2bit"
+    if isinstance(genotypes,(str,os.PathLike)):
+        return str(Path(str(genotypes)).resolve()),"zarr3"
+    ds=getattr(genotypes,"ds",genotypes)
+    path=getattr(genotypes,"_path",None) or getattr(ds,"attrs",{}).get("genotype_source")
+    return (str(path) if path else "in_memory_xarray"),"xarray"
+
+
 def grm(genotypes, *, components=("additive","dominance"), chromosome=None, method="npplink",
         sample_ids=None, fit_mask=None, min_maf=1e-4, block_size='auto',
         output_dtype=np.float32, blas_threads='auto', progress=False,
@@ -317,7 +562,12 @@ def grm(genotypes, *, components=("additive","dominance"), chromosome=None, meth
         Parameters
         ----------
         genotypes : object
-            Path to a PLINK1 BED prefix supplying genotypes to this scientific analysis and its data source metadata.
+            PLINK1 BED prefix, a VIGOR Zarr genotype store path (``write_genotype_zarr``), or an
+            ``xarray.Dataset``/``DataArray`` with ``sample``/``variant`` (or ``iid``/``snp``)
+            dimensions such as returned by ``open_genotype_dataset``. Zarr/xarray inputs are read
+            lazily in bounded variant blocks through the ``build_grms`` block reader (float-BLAS
+            engine); Zarr v3 StringDType identifiers are coerced to Python strings. Optional
+            ``fid``/``sex`` variables on ``sample`` supply FID and sex (defaults: IID and ``'0'``).
         components : object
             Requested genetic components, additive and/or dominance, estimated with component-specific valid denominator weights. Default: ``('additive', 'dominance')``.
         chromosome : object
@@ -395,12 +645,13 @@ def grm(genotypes, *, components=("additive","dominance"), chromosome=None, meth
     ds=xr.Dataset(variables,coords=coords)
     ds=ds.assign_coords(fid=("sample_i",np.asarray(fid,dtype=str)),
                         sex=("sample_i",np.asarray(sexes,dtype=str)))
+    location,source_type=_source_description(genotypes)
     ds.attrs.update({"grm_schema":GRM_SCHEMA_VERSION,"grm_method":method,"normalization":diag["normalization"] if "normalization" in diag else "global_HWE",
                      "n_variants_total":int(diag["n_variants_total"]),
                      "n_variants_used":int(diag["n_variants_used"]),
                      "chromosome_type":_chromosome_class(chrom,n_autosomes),
-                     "source_prefix":str(Path(_prefix(genotypes)).resolve()),
-                     "genotype_source_type":"PLINK1_2bit",
+                     "source_prefix":location,
+                     "genotype_source_type":source_type,
                      "missingness_policy":diag.get("missingness","mean_imputed"),
                      "dosage_compensation_status":dosage,
                      "n_autosomes":int(n_autosomes)})
@@ -463,7 +714,9 @@ def GRMs(genotypes, output_file="grm/grm.zarr", dosage_compensation=True,
         Parameters
         ----------
         genotypes : object
-            Path to a PLINK1 BED prefix supplying genotypes to this scientific analysis and its data source metadata.
+            PLINK1 BED prefix, a VIGOR Zarr genotype store path or an ``xarray.Dataset``/``DataArray``
+            genotype object (see ``grm``). Zarr/xarray inputs are opened once, lazily, and every
+            chromosome is accumulated from bounded blocks via the ``build_grms`` block reader.
         output_file : object
             Filesystem path of the Zarr version three chromosome archive, with overwrite safety enforced. Default: ``'grm/grm.zarr'``.
         dosage_compensation : object
@@ -514,14 +767,37 @@ def GRMs(genotypes, output_file="grm/grm.zarr", dosage_compensation=True,
     """
     import zarr
     method,components=validate_grm_method(method,components)
-    prefix=_prefix(genotypes);out=Path(output_file)
+    out=Path(output_file)
     if out.exists() and not overwrite:raise FileExistsError(f"{out} exists; use overwrite=True")
-    from .io import PlinkReader
-    with PlinkReader(prefix,dtype=np.float32) as reader:
-        available=reader.bim.chrom.astype(str).unique().tolist()
-        autosomes=[c for c in available if _chromosome_class(c,n_autosomes)=='autosome']
-        if method in {'npplink','gcta0'} and int(reader.bim.chrom.astype(str).isin(autosomes).sum()) > 2**24:
-            raise ValueError('pairwise float32 counts support at most 2**24 autosomal variants')
+    xsrc,owned=_open_xarray_genotypes(genotypes) if _is_xarray_source(genotypes) else (None,False)
+    try:
+        return _GRMs_impl(genotypes,xsrc,out,zarr,dosage_compensation=dosage_compensation,
+            components=components,method=method,sample_ids=sample_ids,fit_mask=fit_mask,
+            min_maf=min_maf,block_size=block_size,output_dtype=output_dtype,blas_threads=blas_threads,
+            n_autosomes=n_autosomes,chunks=chunks,shard_factor=shard_factor,progress=progress,
+            overwrite=overwrite,sex_embedding=sex_embedding,engine=engine,
+            memory_fraction=memory_fraction,maxmem=maxmem)
+    finally:
+        if owned and hasattr(xsrc,"close"):xsrc.close()
+
+
+def _GRMs_impl(genotypes, xsrc, out, zarr, *, dosage_compensation, components, method, sample_ids,
+               fit_mask, min_maf, block_size, output_dtype, blas_threads, n_autosomes, chunks,
+               shard_factor, progress, overwrite, sex_embedding, engine, memory_fraction, maxmem):
+    """Body of ``GRMs``; ``xsrc`` is the opened lazy Zarr/xarray source or None for PLINK1 input."""
+    if xsrc is None:
+        prefix=_prefix(genotypes)
+        from .io import PlinkReader
+        with PlinkReader(prefix,dtype=np.float32) as reader:
+            chrom_col=reader.bim.chrom.astype(str)
+    else:
+        prefix=xsrc  # grm() recognises the opened source and reuses it chromosome by chromosome
+        chrom_col=pd.Series(_object_strings(xsrc.variant_metadata.chromosome)).astype(str)
+    location,source_type=_source_description(genotypes)
+    available=chrom_col.unique().tolist()
+    autosomes=[c for c in available if _chromosome_class(c,n_autosomes)=='autosome']
+    if method in {'npplink','gcta0'} and int(chrom_col.isin(autosomes).sum()) > 2**24:
+        raise ValueError('pairwise float32 counts support at most 2**24 autosomal variants')
     chroms=sorted(available,key=lambda x:
         (0,int(x)) if _chromosome_class(x,n_autosomes)=="autosome" else
         (1,{"X":0,"Y":1,"XY":2,"MT":3}.get(_chromosome_class(x,n_autosomes),99),str(x)))
@@ -559,8 +835,8 @@ def GRMs(genotypes, output_file="grm/grm.zarr", dosage_compensation=True,
                                     np.asarray([emb_status],dtype="<U64"))
             # Only static attributes persist on the root; chromosome QC lives in variables.
             ds.attrs={"grm_schema":GRM_SCHEMA_VERSION,"grm_complete":False,
-                      "grm_method":method,"genotype_source_type":"PLINK1_2bit",
-                      "source_prefix":str(Path(prefix).resolve()),
+                      "grm_method":method,"genotype_source_type":source_type,
+                      "source_prefix":location,
                       "n_autosomes":n_autosomes,"zarr_format":3,
                       "aggregation":"sum(raw_numerator_chr) / component_denominator_from_summed_counts" if method in {"npplink","gcta0"} else "sum(K_chr * weight_chr) / sum(weight_chr)",
                       "dosage_rule":"male_X_haploid_01_double_only_if_confident; otherwise skip",

@@ -5807,15 +5807,108 @@ def _genomic_features_input(features):
     return _as_pandas_input(features)
 
 
+def _genotype_column_reader(genotypes, snp_names=None):
+    """Return ``(n_animals, n_snps, snp_names, get)`` where ``get(cols)`` reads a float64 column block.
+
+    Dense arrays/DataFrames are sliced, sparse matrices densify only the requested columns, and
+    xarray objects (``sample``/``variant`` or ``iid``/``snp`` dims; a Dataset uses ``GT`` then
+    ``DS``) load only the requested variant block, so no full N × M copy is made here.
+
+    Parameters
+    ----------
+    genotypes : array-like, pandas.DataFrame, scipy.sparse matrix, xarray.DataArray or Dataset
+        Animals × variants genotype panel.
+    snp_names : sequence of str or None
+        Variant labels for unlabeled inputs; default names are ``snp<j>``.
+    """
+    import scipy.sparse as _sp
+    def labels(m, fallback=None):
+        """Variant labels as Python strings (Zarr v3 StringDType coordinates included)."""
+        if fallback is not None: return [str(v) for v in np.asarray(fallback).ravel()]
+        return list(map(str,snp_names)) if snp_names is not None else [f'snp{j}' for j in range(m)]
+    if _is_xr_dataset(genotypes):
+        genotypes=genotypes['GT'] if 'GT' in genotypes else genotypes['DS']
+    if _is_xr_dataarray(genotypes):
+        sd=next((d for d in ('sample','iid') if d in genotypes.dims),genotypes.dims[0])
+        vd=next((d for d in ('variant','snp') if d in genotypes.dims),[d for d in genotypes.dims if d!=sd][0])
+        da=genotypes.transpose(sd,vd)
+        names=labels(da.sizes[vd],da[vd].values if vd in da.coords else None)
+        return int(da.sizes[sd]),int(da.sizes[vd]),names,lambda j: np.asarray(da.isel({vd:np.asarray(j)}).values,np.float64)
+    if _sp.issparse(genotypes):
+        G=genotypes.tocsc()
+        return G.shape[0],G.shape[1],labels(G.shape[1]),lambda j: np.asarray(G[:,np.asarray(j)].toarray(),np.float64)
+    if isinstance(genotypes,pd.DataFrame):
+        return genotypes.shape[0],genotypes.shape[1],list(map(str,genotypes.columns)),lambda j: genotypes.iloc[:,np.asarray(j)].to_numpy(np.float64)
+    A=np.asarray(genotypes)
+    if A.ndim!=2: raise ValueError('genotypes must be a 2-D animals x variants panel')
+    return A.shape[0],A.shape[1],labels(A.shape[1]),lambda j: np.asarray(A[:,np.asarray(j)],np.float64)
+
+
+def _snp_top_k_screen(get, candidates, screen_traits, fit, top_k, block_size=4096):
+    """Training-only top-k SNP screen reusing the screened-ridge expert's marginal statistic.
+
+    Each candidate is mean-imputed and standardized on training rows (fit_mask and at least one
+    finite target); its score is the maximum over target columns of
+    ``|z' (r - mean_r)| / n_obs``. Held-out rows never enter imputation, scaling or scoring.
+
+    Parameters
+    ----------
+    get : callable
+        Column-block reader from ``_genotype_column_reader``.
+    candidates : numpy.ndarray
+        Candidate SNP column positions.
+    screen_traits : array-like
+        Animals × traits training targets (NaN ignored).
+    fit : numpy.ndarray
+        Boolean training-animal mask.
+    top_k : int
+        Number of SNPs retained.
+    block_size : int
+        Candidate columns scored per block. Default: ``4096``.
+
+    Returns
+    -------
+    tuple
+        Sorted retained positions and a screen record (method, top_k, candidates, rows, scores).
+    """
+    from .prediction_experts import _marginal_screen_scores
+    R=np.asarray(screen_traits,dtype=float)
+    if R.ndim==1: R=R[:,None]
+    if R.shape[0]!=len(fit): raise ValueError('screen_traits must have one row per animal in GRM order')
+    tr=np.flatnonzero(fit & np.isfinite(R).any(1))
+    if len(tr)<3: raise ValueError('snp_top_k screen needs at least three training animals with finite screen_traits')
+    cand=np.asarray(candidates,int); score=np.zeros(len(cand)); Rt=R[tr]
+    for s in range(0,len(cand),max(1,int(block_size))):
+        Xb=get(cand[s:s+int(block_size)])[tr]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore',RuntimeWarning); m=np.nanmean(Xb,axis=0)
+        m=np.where(np.isfinite(m),m,0.); Xb=np.where(np.isfinite(Xb),Xb,m[None,:])
+        sd=Xb.std(0); sd=np.where(sd>1e-8,sd,1.)
+        score[s:s+Xb.shape[1]]=_marginal_screen_scores((Xb-Xb.mean(0))/sd,Rt).max(1)
+    k=min(max(1,int(top_k)),len(cand))
+    pick=np.argpartition(score,-k)[-k:] if k else np.array([],int)
+    pick=pick[np.argsort(cand[pick])]
+    return cand[pick],{'method':'training_marginal_abs_cov_max_over_traits','top_k':int(k),
+                       'n_candidates':int(len(cand)),'n_screen_rows':int(len(tr)),'scores':score[pick]}
+
+
 @_dataset_result(_genomic_features_dataset)
 def make_genomic_features(GRM,*,fit_mask=None,n_grm_components=32,per_chromosome_grms=None,
                           n_chr_components=8,genotypes=None,selected_snps=None,snp_names=None,
-                          include_dominance=False,index=None,random_state=0,dtype=np.float32,return_state=False,save_path=None):
+                          include_dominance=False,index=None,random_state=0,dtype=np.float32,return_state=False,save_path=None,
+                          snp_top_k=None,screen_traits=None,max_dense_snps=20000,snp_block_size=4096):
     """Build leakage-safe genomic features from GRMs and optionally raw/selected SNPs.
 
     GRM features are U sqrt(S). If fit_mask is supplied, the eigensystem is estimated only in
     training animals and every row is Nyström-projected through K[:, train]. SNP means and allele
     frequencies are likewise learned from fit_mask only.
+
+    Genome-wide panels are never densified as a whole: SNP columns are read in blocks of
+    ``snp_block_size`` and only the retained columns are written (in ``dtype``). Retaining all
+    SNPs (``selected_snps=None`` or ``'all'``) is allowed only up to ``max_dense_snps``;
+    above it a ValueError points to ``snp_top_k``, the training-only marginal screen (the same
+    ``|z' (r - mean)| / n_obs`` statistic used by the screened-ridge prediction expert) applied
+    to ``screen_traits`` on ``fit_mask`` rows.
 
     Parameters
     ----------
@@ -5849,18 +5942,16 @@ def make_genomic_features(GRM,*,fit_mask=None,n_grm_components=32,per_chromosome
         caller for the scientific representation; the shown operation constrains the required
         type/shape. Default: ``8``.
 
-    genotypes : array-like or pandas.DataFrame
-        Genotype values with animals in rows and variants in columns, or the genotype source
-        accepted by this entry point. Biallelic dosage uses 0/1/2; preserve sample/variant
-        labels and the coding expected by the selected kernel or association model. Default:
-        ``None``. None delegates to the local fallback shown in this body; it is not an
-        additional numeric/category value.
+    genotypes : array-like, pandas.DataFrame, scipy.sparse matrix, xarray.DataArray or Dataset
+        Genotype values with animals in rows and variants in columns (0/1/2 dosage, NaN
+        missing). Sparse matrices and lazy (Dask/Zarr-backed) xarray objects with
+        ``sample``/``variant`` (or ``iid``/``snp``) dimensions are read column block by column
+        block; a Dataset uses its ``GT`` (else ``DS``) variable. Default: ``None``.
 
-    selected_snps : sequence or integer array
-        Identifiers or zero-based positions of selected/protected items on the corresponding
-        input axis. Entries must exist; paired index arrays define the row/column pairs to
-        compute. Default: ``None``. None delegates to the local fallback shown in this body; it
-        is not an additional numeric/category value.
+    selected_snps : sequence, integer array, 'all' or None
+        Variant names or zero-based positions to keep, or 'all'/None for every variant (subject
+        to ``max_dense_snps``). With ``snp_top_k`` they are the screening candidates.
+        Default: ``None``.
 
     snp_names : sequence of str
         Variant labels in genotype-column order, used to identify the association or
@@ -5898,6 +5989,28 @@ def make_genomic_features(GRM,*,fit_mask=None,n_grm_components=32,per_chromosome
         Optional .zarr path; when given the result is written as consolidated, sharded Zarr v3
         and returned reopened lazily. Default: ``None``.
 
+    snp_top_k : int or None
+        Keep the top-k candidate SNPs ranked by the training-only marginal screen (maximum over
+        ``screen_traits`` columns of the absolute covariance between the standardized SNP and
+        the centered target, on ``fit_mask`` rows only). Requires ``screen_traits``; the
+        retained positions and their scores are recorded in ``state['snp']['screen']``.
+        Default: ``None`` (no screen).
+
+    screen_traits : array-like, pandas.DataFrame/Series or None
+        Training phenotypes or BLUP residuals (animals × traits in GRM order; labeled inputs
+        are reindexed to ``index``) used by ``snp_top_k``. NaN cells and rows outside
+        ``fit_mask`` are ignored, so held-out outcomes must be masked or excluded by fit_mask.
+        Default: ``None``.
+
+    max_dense_snps : int or None
+        Largest number of SNP columns materialised without a screen; requests for more (for
+        example ``selected_snps='all'`` on a genome-wide panel) raise a ValueError pointing to
+        ``snp_top_k``. None disables the guard. Default: ``20000``.
+
+    snp_block_size : int
+        SNP columns read per block for screening and feature construction; bounds float64
+        scratch to n_animals × snp_block_size. Default: ``4096``.
+
     Returns
     -------
     xarray.Dataset
@@ -5920,20 +6033,44 @@ def make_genomic_features(GRM,*,fit_mask=None,n_grm_components=32,per_chromosome
             F,st=_kernel_pc_features(K,fit,n_chr_components,random_state+1000+ki,dtype=dtype); parts.append(F)
             names.extend([f'grm_chr{name}_pc{j+1:03d}' for j in range(F.shape[1])]); state['kernels'][f'chr{name}']=st
     if genotypes is not None:
-        X=genotypes.to_numpy(float) if isinstance(genotypes,pd.DataFrame) else np.asarray(genotypes,float)
-        if X.shape[0]!=n: raise ValueError('genotypes and GRM must have the same number of animals')
-        all_names=list(map(str,genotypes.columns)) if isinstance(genotypes,pd.DataFrame) else (list(map(str,snp_names)) if snp_names is not None else [f'snp{j}' for j in range(X.shape[1])])
-        if selected_snps is None: take=np.arange(X.shape[1])
+        n_rows,n_snp,all_names,get=_genotype_column_reader(genotypes,snp_names)
+        if n_rows!=n: raise ValueError('genotypes and GRM must have the same number of animals')
+        explicit_all=isinstance(selected_snps,str) and selected_snps.lower()=='all'
+        if isinstance(selected_snps,str) and not explicit_all: selected_snps=[selected_snps]
+        if selected_snps is None or explicit_all: take=np.arange(n_snp)
         elif len(selected_snps)==0: take=np.array([],int)
         elif isinstance(selected_snps[0],str):
             pos={x:i for i,x in enumerate(all_names)}; take=np.asarray([pos[str(x)] for x in selected_snps if str(x) in pos],int)
         else: take=np.asarray(selected_snps,int)
-        X=X[:,take]; sn=[all_names[j] for j in take]; mu=np.nanmean(X[fit],axis=0); Xi=np.where(np.isfinite(X),X,mu[None,:])
-        parts.append(np.asarray(Xi,dtype=dtype)); names.extend([f'snp_{x}' for x in sn])
-        p=np.clip(np.nanmean(X[fit],axis=0)/2,1e-6,1-1e-6); st={'indices':take,'names':sn,'mean':mu,'p':p}
-        if include_dominance:
-            q=1-p; D=np.where(Xi==0,-2*p[None,:]**2,np.where(Xi==1,2*p[None,:]*q[None,:],np.where(Xi==2,-2*q[None,:]**2,0.0)))
-            parts.append(np.asarray(D,dtype=dtype)); names.extend([f'dom_{x}' for x in sn])
+        bs=max(1,int(snp_block_size)); screen=None
+        if snp_top_k is not None:
+            if screen_traits is None:
+                raise ValueError('snp_top_k requires screen_traits: training phenotypes/residuals (animals x traits, GRM order); rows outside fit_mask are ignored')
+            if isinstance(screen_traits,(pd.DataFrame,pd.Series)) and len(screen_traits.index.intersection(index)):
+                screen_traits=screen_traits.reindex(index)
+            take,screen=_snp_top_k_screen(get,take,screen_traits,fit,int(snp_top_k),bs)
+        elif max_dense_snps is not None and len(take)>int(max_dense_snps):
+            what="all SNPs" if (selected_snps is None or explicit_all) else f"{len(take)} selected SNPs"
+            raise ValueError(
+                f"make_genomic_features would materialise a dense {n} x {len(take)} genotype feature matrix "
+                f"({what}; max_dense_snps={int(max_dense_snps)}). Use snp_top_k=<k> with screen_traits=<training "
+                "phenotypes> for a training-only top-k SNP screen (fit_mask rows only), pass a shorter selected_snps "
+                "list, or raise max_dense_snps if memory allows.")
+        k=len(take); sn=[all_names[j] for j in take]; mu=np.zeros(k); p=np.zeros(k)
+        A=np.empty((n,k),dtype=dtype); D=np.empty((n,k),dtype=dtype) if include_dominance else None
+        # Column blocks bound float64 scratch to n x snp_block_size; output is written in dtype.
+        for s in range(0,k,bs):
+            Xb=get(take[s:s+bs]); sl=slice(s,s+Xb.shape[1])
+            m=np.nanmean(Xb[fit],axis=0); Xi=np.where(np.isfinite(Xb),Xb,m[None,:]); A[:,sl]=Xi
+            pb=np.clip(m/2,1e-6,1-1e-6); mu[sl]=m; p[sl]=pb
+            if D is not None:
+                q=1-pb; D[:,sl]=np.where(Xi==0,-2*pb[None,:]**2,np.where(Xi==1,2*pb[None,:]*q[None,:],np.where(Xi==2,-2*q[None,:]**2,0.0)))
+            del Xb,Xi
+        parts.append(A); names.extend([f'snp_{x}' for x in sn])
+        st={'indices':take,'names':sn,'mean':mu,'p':p}
+        if screen is not None: st['screen']=screen
+        if D is not None:
+            parts.append(D); names.extend([f'dom_{x}' for x in sn])
         state['snp']=st
     F=np.concatenate(parts,axis=1) if parts else np.zeros((n,0),dtype=dtype); df=pd.DataFrame(F,index=index,columns=names)
     return {'features':df,'state':state} if return_state else df
@@ -25900,7 +26037,9 @@ def mvBLUP(
     
     Defaults use kernel_rank='full' and accuracy='auto': exact float64 for small
     problems and full-kernel float32 for n>=1024. Use accuracy='exact' to force
-    float64 exact conditioning. If G=None, fit sparse G+E with training-only
+    float64 exact conditioning. ``accuracy='exact'`` only selects float64 working
+    arithmetic (and a full, uncompressed kernel); it does not compute prediction-error
+    variances (PEV) or reliabilities. If G=None, fit sparse G+E with training-only
     animal-fold selection; use optimize_hyperparameters_cv>=2 for Optuna.
     Supplying pre-fitted G/E bypasses fitting, preserving legacy prediction.
     
@@ -26042,9 +26181,10 @@ def mvBLUP(
     accuracy : str
         Conditioning precision: 'auto' selects 'exact' below 1024 animals and 'fast' at/above
         1024; 'exact' forces float64/full-kernel conditioning, while 'fast' permits float32 and
-        requested kernel compression. prepare_mvBLUP_plan accepts only 'exact' and 'fast'.
-        Default: ``'auto'``.
-    
+        requested kernel compression. 'exact' refers to float64 arithmetic only: the same
+        breeding-value point predictions are returned, and no prediction-error variances are
+        computed. prepare_mvBLUP_plan accepts only 'exact' and 'fast'. Default: ``'auto'``.
+
     **legacy_kwargs : dict
         Unsupported historical options are rejected with TypeError.
     

@@ -112,17 +112,102 @@ def _native_loadings_from_fit(fit,component,rank):
     return L,psi,dec
 
 
+def _residualize(Y, covariates):
+    """Least-squares covariate adjustment per trait on its observed cells."""
+    fitY = Y.copy()
+    if covariates is None:
+        return fitY
+    C = covariates.to_numpy(float)
+    if C.ndim == 1:
+        C = C[:, None]
+    if C.shape[0] != len(Y) or not np.isfinite(C).all():
+        raise ValueError("covariates must be finite and sample aligned")
+    C = np.column_stack([np.ones(len(Y)), C])
+    for col in Y:
+        mask = Y[col].notna().to_numpy()
+        fitY.loc[mask, col] -= C[mask] @ np.linalg.lstsq(C[mask], Y.loc[mask, col], rcond=None)[0]
+    return fitY
+
+
+def _group_dual(fitY, K, G, E, null_solver_kwargs):
+    """Observed-space mvBLUP dual V^-1(y - mu) for one background, animals x traits.
+
+    Zero on unobserved cells. ``A @ L`` gives the exact factor-score directions:
+    the score of loading vector l for a centered genotype x is x'(A l).
+    """
+    opts = dict(null_solver_kwargs or {})
+    names = fitY.columns
+    frame = lambda m: pd.DataFrame(np.asarray(m, float), index=names, columns=names)
+    Gf = {k: frame(v) for k, v in G.items()} if isinstance(G, dict) else frame(G)
+    state = mv._mvPredict_raw(fitY, K, Gf, frame(E), return_state=True,
+                              solver_tol=float(opts.get("solver_tol", 1e-6)),
+                              solver_maxiter=int(opts.get("solver_maxiter", 1000)), progress=False)
+    return state["A"].reindex(index=fitY.index, columns=names).to_numpy(float)
+
+
+def _grammar_gamma(null, calibration, active, sigma, L):
+    """Per-factor gamma = median(exact information / (x'x sigma_kk)) over calibration variants."""
+    from .gwas.exact import score_design_block
+    if len(calibration) < 10:
+        warnings.warn(f"only {len(calibration)} polymorphic calibration variants; gamma set to 1",
+                      RuntimeWarning, stacklevel=3)
+        return np.ones(L.shape[1]), len(calibration)
+    X = np.column_stack(calibration).astype(np.float64)
+    exact = score_design_block(null, X[:, :, None], basis=L)
+    info = 1.0 / exact["beta_se"].values ** 2
+    a = X[active]
+    finite = np.isfinite(a)
+    counts = finite.sum(axis=0)
+    mean = np.divide(np.where(finite, a, 0.0).sum(axis=0), counts, out=np.zeros(a.shape[1]), where=counts > 0)
+    xc = np.where(finite, a - mean, 0.0)
+    ols = np.einsum("ij,ij->j", xc, xc)[:, None] * np.diag(sigma)[None, :]
+    ratio = np.where(np.isfinite(info) & (ols > 0), info / np.where(ols > 0, ols, 1.0), np.nan)
+    gamma = np.nanmedian(np.where(ratio > 0, ratio, np.nan), axis=0)
+    return np.where(np.isfinite(gamma) & (gamma > 0), gamma, 1.0), X.shape[1]
+
+
+def _factor_dataset(result, omnibus, meta, cols):
+    """Variant-by-factor Dataset with the exact engine's schema."""
+    import xarray as xr
+    from . import __version__
+    data = {name: (("variant", "trait"), value) for name, value in result.items()}
+    data.update({f"omnibus_{name}": (("variant",), value) for name, value in omnibus.items()})
+    ds = xr.Dataset(data, coords={"variant": np.arange(len(meta), dtype=np.int64),
+                                  "trait": np.asarray(cols, str),
+                                  "variant_id": ("variant", meta.variant_id.astype(str).to_numpy())},
+                    attrs={"vigor_version": __version__,
+                           "coordinate_test": "one-direction score; all other tested effects fixed to zero",
+                           "null_covariance_uncertainty": "conditional on supplied G/E estimates"})
+    for name in ("log_p", "conditional_log_p", "omnibus_log_p"):
+        ds[name].attrs["units"] = "natural log probability"
+    for name in ("neglog_p", "conditional_neglog_p", "omnibus_neglog_p"):
+        ds[name].attrs["units"] = "-log10 probability"
+    return ds
+
+
 def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
                component="G", covariance=None, factors=None, background="loco",
-               method="exact", score_method="direct", heterogeneity=True,
-               loco_factor="refit", covariance_rank_G=100, covariance_rank_E=50,
+               method="grammar_gamma", score_method="direct", heterogeneity=None,
+               loco_factor=None, covariance_rank_G=100, covariance_rank_E=50,
                covariance_kwargs=None, factor_method="native", factor_standardize=False,
                marker_coding="additive", groups=None, background_kernels=None,
                block_size=128, chromosomes=None, random_state=0,
                null_solver_kwargs=None, covariates=None, out=None, projection_out=None,
                max_return_rows=2_000_000, variant_chunk=1024, shard_variants=16384,
-               maxmem=None, **retired):
-    """Test LOCO factor effect directions in the exact full-trait Gaussian null.
+               maxmem=None, gamma_snps=200, gamma_scope="auto", rescore_p=1e-5,
+               rescore_max=5000, **retired):
+    """Test LOCO factor effect directions in the full-trait Gaussian null.
+
+    The default ``method='grammar_gamma'`` is the fast genome-wide mode. Per
+    exclusion group it computes the observed-space mvBLUP dual A = V^-1(y - mu)
+    with the LOCO kernel, so the factor scores u = x'(A L) are exact (including
+    missing phenotype cells); only the information x'Px is approximated by
+    x'x * S, where S is the factor-score covariance rescaled per factor by
+    gamma = median(exact information / x'x S_kk) over ``gamma_snps`` strided
+    variants. Variants whose approximate joint test passes ``rescore_p`` are
+    rescored with the exact engine (``exact_rescored`` marks them). Covariance
+    and axes are estimated once (``loco_factor='fixed'``) unless 'refit' is set.
+    ``method='exact'`` scores every variant with the exact engine.
 
     Parameters
     ----------
@@ -131,7 +216,10 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
     GRM : kernel, named kernels, or canonical chromosome store, optional
         Supplied background; group-keyed inputs should use background_kernels.
     decomposition, covariance : fitted result or matrix, optional
-        Axes used only with explicit loco_factor='fixed' sensitivity mode.
+        Fitted model whose axes are tested with loco_factor='fixed'. In the
+        grammar_gamma mode a supplied decomposition also provides G and E, so no
+        covariance is fitted at all; otherwise one fit on the first LOCO kernel
+        is reused for every group.
     genotypes : DataFrame, source or path
         Sample-by-variant counted-allele dosage.
     component : str
@@ -140,16 +228,21 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         Number of tested axes, default min(10,t). Rank must stay equal across groups.
     background : {'loco','provided'}
         Construct leave-group-out backgrounds or require supplied kernels.
-    method : {'exact'}
-        All variants use exact information; calibration/rescoring modes retired.
+    method : {'grammar_gamma', 'exact'}
+        'grammar_gamma' (default): exact scores, gamma-calibrated information and
+        exact rescoring of hits. 'exact': exact information for every variant.
     score_method : {'direct','subspace'}
         Restrict beta_trait=L beta_factor in the full original-trait null.
-    heterogeneity : bool
+    heterogeneity : bool, optional
         Also report nested full-trait minus factor-subspace score statistic.
-        This requires full-trait exact information and can be expensive.
-    loco_factor : {'refit','fixed'}
-        Refit axes per excluded chromosome. Fixed axes are an explicit sensitivity
-        analysis, with covariance/null still fitted per exclusion group.
+        This requires full-trait exact information and can be expensive. Default
+        True for 'exact'; False for 'grammar_gamma', where True reports it for the
+        exact-rescored variants only.
+    loco_factor : {'refit','fixed'}, optional
+        'refit' re-estimates covariance and axes per excluded chromosome. 'fixed'
+        keeps one set of axes. Default 'fixed' for 'grammar_gamma' (one covariance
+        fit) and 'refit' for 'exact'. With 'exact' + 'fixed' the null covariance
+        is still fitted per exclusion group (sensitivity analysis).
     covariance_rank_G, covariance_rank_E : int or 'full'
         Default covariance ranks unless covariance_kwargs specifies them.
     covariance_kwargs : mapping, optional
@@ -185,6 +278,16 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         Persisted chunk and shard lengths.
     maxmem : memory size, optional
         Genotype source block budget.
+    gamma_snps : positive int
+        Variants per group, taken by stride, used to estimate gamma. Default 200.
+    gamma_scope : {'auto', 'group', 'first'}
+        Estimate gamma per group ('group'), once on the first group ('first'),
+        or per group only when the exact information is cheap, i.e. complete
+        phenotypes and one dense kernel ('auto').
+    rescore_p : float
+        Approximate joint p-value below which variants are rescored exactly.
+    rescore_max : positive int
+        Maximum candidate genotype columns cached per group for rescoring.
     **retired : mapping
         Unknown/retired controls fail explicitly; see ROUND3_MIGRATION.md.
 
@@ -197,19 +300,28 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
 
     Complexity
     ----------
-    Per-group covariance/eigendecomposition plus exact O(m*r) RHS solves for r
-    factors; heterogeneity adds O(m*t) solves. Result memory is one block with out.
+    grammar_gamma: one mvBLUP solve per group, one O(n m r) GEMM per block and
+    exact scoring of ``gamma_snps`` plus the rescored variants; per-group results
+    (m x r) are held until gamma is known. exact: per-group covariance fit plus
+    exact information for every variant (O(m r) solves, or one GEMM per block
+    for complete phenotypes and one dense kernel); heterogeneity adds O(m t).
     """
     from .gwas.scan import (scan_inputs, background_for_group, genotype_blocks,
                             attach_variant_metadata, finish_scan, covariance_matrices,
                             scan_covariates)
-    from .gwas.exact import prepare_score_null, score_block, chi2_logsf
+    from .gwas.exact import (prepare_score_null, score_block, score_design_block, chi2_logsf,
+                             _finalize_scores, _spectral_state)
     from pathlib import Path
     if retired:
         raise TypeError("retired factorGWAS controls: " + ", ".join(sorted(retired)) +
                         "; see docs/ROUND3_MIGRATION.md")
-    if method != "exact" or score_method not in {"direct", "subspace"}:
-        raise ValueError("use method='exact', score_method='direct'; posterior/fast scans are retired")
+    if method not in {"grammar_gamma", "exact"} or score_method not in {"direct", "subspace"}:
+        raise ValueError("method must be 'grammar_gamma' or 'exact' and score_method 'direct'")
+    fast = method == "grammar_gamma"
+    if loco_factor is None:
+        loco_factor = "fixed" if fast else "refit"
+    if heterogeneity is None:
+        heterogeneity = not fast
     if loco_factor not in {"refit", "fixed"}:
         raise ValueError("loco_factor must be refit or fixed")
     if marker_coding not in {"additive", "dominance"}:
@@ -220,6 +332,8 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         raise ValueError("native factor directions cannot be restandardized")
     if genotypes is None:
         raise ValueError("genotypes are required")
+    if gamma_scope not in {"auto", "group", "first"}:
+        raise ValueError("gamma_scope must be 'auto', 'group' or 'first'")
     if projection_out is not None and out is not None:
         association_path = str(out) if str(out).endswith('.zarr') else str(out) + '.zarr'
         if Path(projection_out).resolve() == Path(association_path).resolve():
@@ -249,96 +363,225 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         raise ValueError("requested exclusion group absent from variants")
     if len(set(labels)) != len(labels):
         raise ValueError("requested exclusion groups must be unique")
-    if loco_factor == "fixed":
+    if loco_factor == "fixed" and not fast:
         warnings.warn("fixed factor axes may include the tested chromosome; sensitivity analysis only", RuntimeWarning, stacklevel=2)
         if decomposition is None and covariance is None:
             raise ValueError("fixed mode requires decomposition or covariance")
+    # Covariate-adjusted phenotypes for covariance fitting and the fast dual; the
+    # exact null keeps covariates as GLS fixed effects instead.
+    fitY = _residualize(Y, covariates)
+    kw = dict(covariance_kwargs or {})
+    kw.setdefault("rank_G", covariance_rank_G); kw.setdefault("rank_E", covariance_rank_E)
+    kw.setdefault("n_boot", 0); kw.setdefault("random_state", int(random_state))
+    kw.setdefault("progress", False)
+    if loco_factor == "refit":
+        kw["warm_start"] = None
+    shared = {}
+
+    def model_for_group(K):
+        """Null covariance (G, E), factor loadings and the fit view for one exclusion group."""
+        if loco_factor == "fixed" and "model" in shared:
+            return shared["model"]
+        if loco_factor == "fixed" and fast and decomposition is not None:
+            fit = decomposition   # one supplied fit: G, E and axes for every group
+        else:
+            fit = mv._genetic_varcov_PSD_raw(K, fitY, **kw)
+        G, E = covariance_matrices(fit)
+        view = mv._result_view(fit)
+        axes_view = mv._result_view(decomposition) if loco_factor == "fixed" and decomposition is not None else view
+        if factor_method == "native":
+            L, psi, _ = _native_loadings_from_fit(axes_view, component, nfac)
+        else:
+            if loco_factor == "fixed" and covariance is not None:
+                Caxis = covariance
+            elif component.lower() in {"g", "genetic"}:
+                Caxis = axes_view["G"]
+            elif component.lower() in {"e", "residual", "environmental"}:
+                Caxis = axes_view["E"]
+            else:
+                Caxis = axes_view["G_components"][component]
+            L, psi, _ = _loadings_from_component(Caxis, nfac, method=factor_method, standardize=factor_standardize)
+        if L.shape[1] != nfac:
+            raise ValueError("a LOCO fit has fewer factor axes than requested; lower factors explicitly")
+        model = (G, E, L, psi, view)
+        if loco_factor == "fixed":
+            shared["model"] = model
+        return model
+
+    def coded(X):
+        if marker_coding != "dominance":
+            return X
+        a = X.to_numpy(np.float32)
+        finite = np.isfinite(a)
+        if np.any(finite & (a != np.round(a))):
+            raise ValueError("dominance requires hardcalls")
+        return pd.DataFrame(np.where(finite, a == 1, np.nan), index=X.index, columns=X.columns)
+
+    def group_attrs(ds, group, L, psi, extra=None):
+        ds.attrs.update(component=str(component), loco_factor=loco_factor, method=method,
+            factor_method=factor_method, marker_coding=marker_coding,
+            scan_group_metadata={str(group): {"factor_loadings": L.tolist(),
+                "factor_specific_variance": psi.tolist(), "factor_trait_names": list(Y.columns),
+                **(extra or {})}},
+            heterogeneity=("nested full-trait minus factor score" + (" (exact-rescored variants only)" if fast else ""))
+                          if heterogeneity else "not requested")
+        return ds
+
+    def add_heterogeneity(ds, full):
+        dof = full.omnibus_dof.values - ds.omnibus_dof.values
+        stat = full.omnibus_stat.values - ds.omnibus_stat.values
+        tolerance = 1e-5 * np.maximum(full.omnibus_stat.values, 1)
+        if np.any(stat < -tolerance):
+            raise RuntimeError("nested heterogeneity score exceeds numerical tolerance")
+        stat = np.where(dof > 0, np.maximum(stat, 0), np.nan)
+        return stat, dof, chi2_logsf(stat, dof)
+
+    def projection_state(group, L, psi, view):
+        key = str(component).lower()
+        nuisance = np.diag(np.maximum(psi, 0.0))
+        if key in {'e', 'residual', 'environmental'}:
+            nuisance += np.asarray(view['G'])
+        else:
+            nuisance += np.asarray(view['E'])
+            if key not in {'g', 'genetic'}:
+                components = view.get('G_components', {})
+                nuisance += sum((np.asarray(value) for name, value in components.items()
+                                 if str(name).lower() != key), np.zeros_like(nuisance))
+        projected, _ = _factor_scores_gls(fitY, L, nuisance, method='posterior')
+        projected.columns = [f'factor{i+1}' for i in range(nfac)]
+        _write_factor_state(projection_out, group, fitY, projected, L, psi,
+                            nuisance, 'posterior_exploratory_separate_from_score_null')
+
+    def exact_group(group, K, G, E, L, psi):
+        null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
+        basis = pd.DataFrame(L, index=Y.columns, columns=[f"factor{i+1}" for i in range(nfac)])
+        for X, meta in genotype_blocks(source, vm, Y.index, group, block_size=block_size):
+            X = coded(X)
+            ds = score_block(null, X, basis=basis)
+            if heterogeneity:
+                stat, dof, logp = add_heterogeneity(ds, score_block(null, X))
+                ds["q_snp"] = ("variant", stat)
+                ds["q_snp_dof"] = ("variant", dof)
+                ds["q_snp_log_p"] = ("variant", logp)
+                ds["q_snp_neglog_p"] = ("variant", -logp / np.log(10))
+            yield group_attrs(attach_variant_metadata(ds, meta, group=group), group, L, psi)
+
+    def grammar_group(group, K, G, E, L, psi):
+        """GRAMMAR-Gamma factor scan of one exclusion group (see factorGWAS Notes)."""
+        names = pd.Index(Y.columns)
+        cols = [f"factor{i+1}" for i in range(nfac)]
+        dual = _group_dual(fitY, K, G, E, null_solver_kwargs)
+        active = Y.notna().any(axis=1).to_numpy()
+        observed = Y.notna().to_numpy()[active].astype(float)
+        Z = dual[active] @ L                                     # exact factor score directions
+        Zc = Z - Z.mean(axis=0)
+        sigma = Zc.T @ Zc / max(int(active.sum()), 1)
+        sigma_inv = np.linalg.pinv(sigma, rcond=1e-10)
+        loaded = (L != 0).astype(float)
+        n_group = int((vm.chromosome.astype(str).to_numpy() == str(group)).sum())
+        stride = max(1, n_group // max(int(gamma_snps), 1))
+        stored, calibration, candidates = [], [], []
+        seen = 0
+        for X, meta in genotype_blocks(source, vm, Y.index, group, block_size=block_size):
+            X = coded(X)
+            raw = X.to_numpy(np.float32)
+            a = raw[active].astype(np.float64)
+            finite = np.isfinite(a)
+            counts = finite.sum(axis=0)
+            mean = np.divide(np.where(finite, a, 0.0).sum(axis=0), counts, out=np.zeros(a.shape[1]), where=counts > 0)
+            xc = np.where(finite, a - mean, 0.0)
+            u = xc.T @ Zc
+            xx = np.einsum("ij,ij->j", xc, xc)
+            nobs = (finite.astype(float).T @ observed) @ loaded
+            pick = np.flatnonzero(((seen + np.arange(a.shape[1])) % stride == 0) & (xx > 0))
+            for j in pick[:max(int(gamma_snps) - len(calibration), 0)]:
+                calibration.append(raw[:, j].copy())
+            # Provisional statistic with gamma = 1 keeps a bounded cache of
+            # candidate genotypes for exact rescoring once gamma is known.
+            provisional = np.einsum("mi,ij,mj->m", u, sigma_inv, u) / np.where(xx > 0, xx, np.inf)
+            for j in np.flatnonzero(provisional >= rescore_cache_stat):
+                candidates.append((provisional[j], len(stored), j, raw[:, j].copy()))
+            if len(candidates) > rescore_max:
+                candidates.sort(key=lambda c: -c[0])
+                del candidates[rescore_max:]
+            stored.append((meta, u, xx, nobs))
+            seen += a.shape[1]
+        if not stored:
+            return
+        # gamma: per group when exact information is cheap (spectral null); otherwise
+        # estimated on the first group and reused (it varies little across LOCO groups).
+        null = None
+        if "gamma" in shared:
+            gamma, gamma_n = shared["gamma"], shared["gamma_n"]
+        else:
+            null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
+            gamma, gamma_n = _grammar_gamma(null, calibration, active, sigma, L)
+            if gamma_scope == "first" or (gamma_scope == "auto" and _spectral_state(null) is None):
+                shared.update(gamma=gamma, gamma_n=gamma_n)
+        root = np.sqrt(gamma)
+        S = sigma * root[:, None] * root[None, :]
+        Sinv = np.linalg.pinv(S, rcond=1e-10)
+        threshold = rescore_stat_threshold(nfac)
+        rescore = {}
+        final = []
+        for _, bi, row, column in candidates:
+            u_row, xx_row = stored[bi][1][row], stored[bi][2][row]
+            if xx_row > 0 and float(u_row @ Sinv @ u_row) / xx_row >= threshold:
+                final.append((bi, row, column))
+        if final:
+            if null is None:
+                null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
+            Xh = np.column_stack([c[2] for c in final]).astype(np.float64)
+            exact = score_design_block(null, Xh[:, :, None], basis=pd.DataFrame(L, index=names, columns=cols))
+            full = score_design_block(null, Xh[:, :, None]) if heterogeneity else None
+            for k, (bi, row, _) in enumerate(final):
+                rescore.setdefault(bi, []).append((row, k))
+        for bi, (meta, u, xx, nobs) in enumerate(stored):
+            info = xx[:, None, None] * S[None]
+            result, omnibus = _finalize_scores(u, info, nobs)
+            ds = _factor_dataset(result, omnibus, meta, cols)
+            ds["exact_rescored"] = ("variant", np.zeros(len(meta), bool))
+            if heterogeneity:
+                for name in ("q_snp", "q_snp_dof", "q_snp_log_p", "q_snp_neglog_p"):
+                    ds[name] = ("variant", np.full(len(meta), np.nan))
+            for row, k in rescore.get(bi, []):
+                for name in ds.data_vars:
+                    if name in exact.data_vars:
+                        ds[name].values[row] = exact[name].values[k]
+                ds["exact_rescored"].values[row] = True
+                if heterogeneity:
+                    stat, dof, logp = add_heterogeneity(exact.isel(variant=[k]), full.isel(variant=[k]))
+                    ds["q_snp"].values[row] = stat[0]; ds["q_snp_dof"].values[row] = dof[0]
+                    ds["q_snp_log_p"].values[row] = logp[0]; ds["q_snp_neglog_p"].values[row] = -logp[0] / np.log(10)
+            ds.attrs.update(engine="grammar_gamma_factor_score",
+                            information="x'x * S, S = factor-score covariance rescaled per factor by gamma "
+                                        "(median exact/OLS information ratio); variants above the rescore "
+                                        "threshold use the exact engine")
+            yield group_attrs(attach_variant_metadata(ds, meta, group=group), group, L, psi,
+                              {"gamma": np.asarray(gamma).tolist(), "gamma_snps": int(gamma_n),
+                               "rescore_p": float(rescore_p),
+                               "exact_rescored": int(sum(len(v) for v in rescore.values()))})
+
+    def rescore_stat_threshold(dof):
+        from scipy.stats import chi2
+        return float(chi2.isf(rescore_p, dof))
+
+    rescore_cache_stat = None
+
     def blocks():
+        nonlocal rescore_cache_stat
+        from scipy.stats import chi2
+        # Cache candidates generously (gamma is not yet known); rescore the strict set.
+        rescore_cache_stat = float(chi2.isf(min(rescore_p * 1e3, 1.0), nfac))
         try:
             for group in labels:
                 K = background_for_group(source, vm, Y.index, group, kernels=GRM,
                     background_kernels=background_kernels, background=background, block_size=block_size,
                     compute_dtype=dict(null_solver_kwargs or {}).get('work_dtype', 'float32'))
-                kw = dict(covariance_kwargs or {})
-                kw.setdefault("rank_G", covariance_rank_G); kw.setdefault("rank_E", covariance_rank_E)
-                kw.setdefault("n_boot", 0); kw.setdefault("random_state", int(random_state))
-                kw.setdefault("progress", False)
-                if loco_factor == "refit":
-                    kw["warm_start"] = None
-                fitY = Y.copy()
-                if covariates is not None:
-                    C = covariates.to_numpy(float)
-                    if C.ndim == 1:
-                        C = C[:, None]
-                    if C.shape[0] != len(Y) or not np.isfinite(C).all():
-                        raise ValueError("covariates must be finite and sample aligned")
-                    C = np.column_stack([np.ones(len(Y)), C])
-                    for col in Y:
-                        mask = Y[col].notna().to_numpy()
-                        fitY.loc[mask, col] -= C[mask] @ np.linalg.lstsq(C[mask], Y.loc[mask, col], rcond=None)[0]
-                fit = mv._genetic_varcov_PSD_raw(K, fitY, **kw)
-                G, E = covariance_matrices(fit)
-                view = mv._result_view(fit)
-                axes = mv._result_view(decomposition) if loco_factor == "fixed" and decomposition is not None else view
-                if factor_method == "native":
-                    L, psi, _ = _native_loadings_from_fit(axes, component, nfac)
-                else:
-                    if loco_factor == "fixed" and covariance is not None:
-                        Caxis = covariance
-                    elif component.lower() in {"g", "genetic"}:
-                        Caxis = axes["G"]
-                    elif component.lower() in {"e", "residual", "environmental"}:
-                        Caxis = axes["E"]
-                    else:
-                        Caxis = axes["G_components"][component]
-                    L, psi, _ = _loadings_from_component(Caxis, nfac, method=factor_method, standardize=factor_standardize)
-                if L.shape[1] != nfac:
-                    raise ValueError("a LOCO fit has fewer factor axes than requested; lower factors explicitly")
+                G, E, L, psi, view = model_for_group(K)
                 if projection_out is not None:
-                    key = str(component).lower()
-                    nuisance = np.diag(np.maximum(psi, 0.0))
-                    if key in {'e', 'residual', 'environmental'}:
-                        nuisance += np.asarray(view['G'])
-                    else:
-                        nuisance += np.asarray(view['E'])
-                        if key not in {'g', 'genetic'}:
-                            components = view.get('G_components', {})
-                            nuisance += sum((np.asarray(value) for name, value in components.items()
-                                             if str(name).lower() != key), np.zeros_like(nuisance))
-                    projected, _ = _factor_scores_gls(fitY, L, nuisance, method='posterior')
-                    projected.columns = [f'factor{i+1}' for i in range(nfac)]
-                    _write_factor_state(projection_out, group, fitY, projected, L, psi,
-                                        nuisance, 'posterior_exploratory_separate_from_score_null')
-                null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
-                basis = pd.DataFrame(L, index=Y.columns, columns=[f"factor{i+1}" for i in range(nfac)])
-                for X, meta in genotype_blocks(source, vm, Y.index, group, block_size=block_size):
-                    if marker_coding == "dominance":
-                        a = X.to_numpy(np.float32)
-                        finite = np.isfinite(a)
-                        if np.any(finite & (a != np.round(a))):
-                            raise ValueError("dominance requires hardcalls")
-                        X = pd.DataFrame(np.where(finite, a == 1, np.nan), index=X.index, columns=X.columns)
-                    ds = score_block(null, X, basis=basis)
-                    if heterogeneity:
-                        full = score_block(null, X)
-                        dof = full.omnibus_dof.values - ds.omnibus_dof.values
-                        stat = full.omnibus_stat.values - ds.omnibus_stat.values
-                        tolerance = 1e-5 * np.maximum(full.omnibus_stat.values, 1)
-                        if np.any(stat < -tolerance):
-                            raise RuntimeError("nested heterogeneity score exceeds numerical tolerance")
-                        stat = np.where(dof > 0, np.maximum(stat, 0), np.nan)
-                        logp = chi2_logsf(stat, dof)
-                        ds["q_snp"] = ("variant", stat)
-                        ds["q_snp_dof"] = ("variant", dof)
-                        ds["q_snp_log_p"] = ("variant", logp)
-                        ds["q_snp_neglog_p"] = ("variant", -logp / np.log(10))
-                    ds = attach_variant_metadata(ds, meta, group=group)
-                    ds.attrs.update(component=str(component), loco_factor=loco_factor,
-                        factor_method=factor_method, marker_coding=marker_coding,
-                        scan_group_metadata={str(group): {"factor_loadings": L.tolist(),
-                            "factor_specific_variance": psi.tolist(), "factor_trait_names": list(Y.columns)}},
-                        heterogeneity="nested full-trait minus factor score" if heterogeneity else "not requested")
-                    yield ds
+                    projection_state(group, L, psi, view)
+                yield from (grammar_group if fast else exact_group)(group, K, G, E, L, psi)
         finally:
             if not hasattr(genotypes, "iter_blocks") and hasattr(source, "close"):
                 source.close()

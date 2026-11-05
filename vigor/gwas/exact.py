@@ -350,15 +350,53 @@ class ExactScoreNull:
             "relative_residual": max((d["relative_residual"] for d in diagnostics), default=0.0)}
 
     def project(self, rhs):
-        """Apply P=V^-1 - V^-1 C(C'V^-1 C)^+ C'V^-1 to one/many RHS."""
+        """Apply P=V^-1 - V^-1 C(C'V^-1 C)^+ C'V^-1 to one/many RHS.
+
+        With the cached W = V^-1 C (see ``prepare_score_null(fixed_cache_bytes=)``)
+        this is one block solve, ``V^-1 x - W F^+ W' x``; otherwise a second
+        solve forms the fixed-effect correction.
+        """
         out, _ = self.solve(rhs)
         weights = self.fixed_information_inverse @ (self.fixed.T @ out)
+        cached = getattr(self, "vinv_fixed", None)
+        if cached is not None:
+            return out - cached @ weights
         correction, _ = self.solve(self.fixed @ weights)
         return out - correction
+
+    @property
+    def dual(self):
+        """Sample-by-trait dual P y (zero on unobserved cells), the fast-scan input.
+
+        ``dual[i, j]`` is the projected phenotype of sample i and trait j; cells
+        are sample-major, matching ``observed``. ``X' dual`` is the score of
+        every trait for the genotype columns of X.
+        """
+        n, t = self.y.shape
+        out = np.zeros(n * t)
+        out[self.observed] = self.py
+        return out.reshape(n, t)
 
     def score_block(self, genotypes, **kwargs):
         """Score one sample-by-variant dosage block; see :func:`score_block`."""
         return score_block(self, genotypes, **kwargs)
+
+
+def _kernel_spectrum(kernel, name):
+    """Float64 eigendecomposition of a dense kernel with float32-aware PSD checking.
+
+    Kernels are often built and stored in float32, so round-off leaves small
+    negative eigenvalues (observed down to -6e-5 x max for VIGOR's own GRMs).
+    The tolerance is therefore tied to float32 precision, independent of the
+    in-memory dtype, and eigenvalues inside it are clipped to zero.
+    """
+    kw, ku = eigh(np.asarray(kernel.dense, dtype=np.float64), check_finite=False)
+    scale = max(float(np.max(np.abs(kw), initial=0)), 1.0)
+    tol = 10 * len(kw) * np.finfo(np.float32).eps * scale
+    if np.min(kw, initial=0) < -tol:
+        raise ValueError(f"animal kernel {name} must be positive semidefinite "
+                         f"(min eigenvalue {np.min(kw):.3g}, tolerance {tol:.3g})")
+    return np.maximum(kw, 0.0), ku
 
 
 def _prepare_preconditioner(null):
@@ -392,12 +430,12 @@ def _prepare_preconditioner(null):
     if kernel.lowrank is not None:
         ku, kw, bulk = kernel.lowrank
     elif kernel.dense is not None:
-        kw, ku = eigh(kernel.dense)
+        kw, ku = _kernel_spectrum(kernel, name)
+        # Reused by the complete-data spectral scorer; one O(n^3) eigh per null.
+        null._kernel_eigen = (name, kw, ku)
         bulk = None
     else:
         raise ValueError("Kronecker preconditioning needs a dense or spectral kernel; use preconditioner='diag' for row-block-only operators")
-    if np.min(kw, initial=0) < -1e-8 * max(np.max(np.abs(kw), initial=0), 1.0):
-        raise ValueError("animal kernel must be positive semidefinite")
     if np.min(gw, initial=0) < -1e-8 * max(np.max(np.abs(gw), initial=0), 1.0):
         raise ValueError("genetic covariance must be positive semidefinite")
     denominator = 1 + np.maximum(kw, 0)[:, None] * np.maximum(gw, 0)[None, :]
@@ -433,7 +471,7 @@ def _prepare_preconditioner(null):
 
 def prepare_score_null(traits, kernels, G, E, *, covariates=None, solver_tol=2e-6,
                        solver_maxiter=400, work_dtype="float32", rhs_block_size=16,
-                       preconditioner="kronecker", jitter=0.0):
+                       preconditioner="kronecker", jitter=0.0, fixed_cache_bytes=2 ** 30):
     """Prepare an exact observed-space multivariate score null.
 
     Parameters
@@ -468,6 +506,10 @@ def prepare_score_null(traits, kernels, G, E, *, covariates=None, solver_tol=2e-
     jitter : nonnegative float
         Explicit residual variance added to V. Zero leaves the supplied model
         unchanged; its value is always recorded in output metadata.
+    fixed_cache_bytes : nonnegative int
+        Keep W = V^-1 C (observed cells x fixed-effect rank, float64) when it
+        fits in this many bytes, so every later projection needs one solve
+        instead of two. 0 disables the cache. Default 1 GiB.
 
     Returns
     -------
@@ -568,16 +610,200 @@ def prepare_score_null(traits, kernels, G, E, *, covariates=None, solver_tol=2e-
     _prepare_preconditioner(null)
     fixed_information = np.empty((fixed_rank, fixed_rank))
     null.fixed_solve_info = []
+    cache = (fixed_cache_bytes is not None and len(observed) * fixed_rank * 8 <= int(fixed_cache_bytes))
+    vinv_fixed = np.empty((len(observed), fixed_rank)) if cache else None
     for start in range(0, fixed_rank, null.rhs_block_size):
         stop = min(start + null.rhs_block_size, fixed_rank)
         solved, info = null.solve(fixed[:, start:stop].toarray())
         fixed_information[:, start:stop] = fixed.T @ solved
+        if cache:
+            vinv_fixed[:, start:stop] = solved
         null.fixed_solve_info.append(info)
     null.fixed_information_inverse, _, _ = _psd_inverse(fixed_information)
+    null.vinv_fixed = vinv_fixed
     null.py = null.project(y.ravel()[observed])
     null.observed_sample = sample
     null.observed_trait = trait
+    # Trait-indicator over observed cells: D' v sums per trait in one sparse GEMM.
+    null.trait_selector = csr_matrix((np.ones(len(observed)), (trait, np.arange(len(observed)))),
+                                     shape=(t, len(observed)))
     return null
+
+
+def _center_designs(x, work_dtype):
+    """Center every (variant, contrast) on its observed genotypes; missing calls become 0.
+
+    Returns the centered float64 designs (n, m, c), rounded through the work
+    dtype exactly as streamed float32 genotypes would be, and the finite mask.
+    """
+    finite = np.isfinite(x)
+    counts = finite.sum(axis=0)
+    mean = np.divide(np.where(finite, x, 0.0).sum(axis=0), counts,
+                     out=np.zeros(counts.shape), where=counts > 0)
+    xc = np.where(finite, x - mean[None], 0.0)
+    return xc.astype(work_dtype).astype(np.float64), finite
+
+
+def _spectral_state(null):
+    """Rotation diagonalising V for a complete single-kernel null, or None.
+
+    With K = U diag(k) U' and T such that T'ET = I and T'GT = diag(g), the
+    sample-major precision is V^-1 vec(M) = vec(U [(U'MT) / (1 + k g')] T').
+    Fixed effects are the same per-trait QR basis Q0 for every trait (complete
+    data), so F = C'V^-1 C, P y and every D'PD follow from rotated quantities.
+    The state is cached on the null; the kernel eigendecomposition is shared
+    with the Kronecker preconditioner.
+    """
+    if hasattr(null, "_spectral"):
+        return null._spectral
+    null._spectral = None
+    n, t = null.y.shape
+    if len(null.kernels) != 1 or len(null.observed) != n * t:
+        return None
+    name, kernel = next(iter(null.kernels.items()))
+    f = null.fixed.shape[1]
+    if kernel.dense is None or f % t:
+        return None
+    p0 = f // t
+    rows = np.arange(n) * t
+    q0 = null.fixed[rows, :p0].toarray()
+    for j in range(1, t):
+        if not np.allclose(null.fixed[rows + j, j * p0:(j + 1) * p0].toarray(), q0, rtol=0, atol=1e-10):
+            return None
+    eig = getattr(null, "_kernel_eigen", None)
+    kw, ku = (eig[1], eig[2]) if eig is not None and eig[0] == name else _kernel_spectrum(kernel, name)
+    ew, eu = eigh(null.residual + null.jitter * np.eye(t))
+    if np.min(ew) <= 0:
+        return None
+    inverse_root = (eu / np.sqrt(ew)) @ eu.T
+    gw, gu = eigh(_sym(inverse_root @ null.covariances[name] @ inverse_root))
+    transform = inverse_root @ gu
+    dinv = 1.0 / (1.0 + kw[:, None] * np.maximum(gw, 0.0)[None, :])
+    q0r = ku.T @ q0
+    # F = C'V^-1 C with columns ordered (trait j, fixed effect a), as in null.fixed.
+    per_root = np.einsum("ia,ib,il->lab", q0r, q0r, dinv, optimize=True)
+    information = np.einsum("jl,kl,lab->jakb", transform, transform, per_root, optimize=True).reshape(f, f)
+    finv, _, _ = _psd_inverse(information)
+    s = (ku.T @ null.y @ transform) * dinv
+    weights = (finv @ (q0r.T @ s @ transform.T).T.ravel()).reshape(t, p0)
+    py_rot = s - (q0r @ weights.T @ transform) * dinv
+    null._spectral = {"ku": ku, "transform": transform, "dinv": dinv, "q0r": q0r,
+                      "finv": finv, "py_rot": py_rot, "p0": p0}
+    return null._spectral
+
+
+def _spectral_scores(sp, xc, finite, b):
+    """Scores u (m, q) and information D'PD (m, q, q) by rotation; q = contrasts x effects.
+
+    Cost per block: one n x n by n x (m c) GEMM plus O(m c^2 t r^2) small work,
+    instead of m c r covariance solves.
+    """
+    n, m, c = xc.shape
+    t, r = b.shape
+    q = c * r
+    ku, transform, dinv, q0r, finv, p0 = (sp[k] for k in ("ku", "transform", "dinv", "q0r", "finv", "p0"))
+    bt = transform.T @ b
+    xt = (ku.T @ xc.reshape(n, m * c)).reshape(n, m, c)
+    u = (xt.reshape(n, m * c).T @ (sp["py_rot"] @ bt)).reshape(m, q)
+    information = np.empty((m, q, q))
+    for cc in range(c):
+        for dd in range(cc, c):
+            weight = (xt[:, :, cc] * xt[:, :, dd]).T @ dinv
+            block = (weight[:, :, None] * bt[None]).transpose(0, 2, 1) @ bt
+            information[:, cc * r:(cc + 1) * r, dd * r:(dd + 1) * r] = block
+            if dd != cc:
+                information[:, dd * r:(dd + 1) * r, cc * r:(cc + 1) * r] = block.transpose(0, 2, 1)
+    # Fixed-effect correction: a = C'V^-1 D for every design column, then a' F^+ a.
+    h = (xt.reshape(n, m * c).T @ (q0r[:, :, None] * dinv[:, None, :]).reshape(n, p0 * t)).reshape(m, c, p0, t)
+    a = np.einsum("jl,lk,mcal->mjack", transform, bt, h, optimize=True).reshape(m, t * p0, q)
+    information -= a.transpose(0, 2, 1) @ (finv @ a)
+    nobs = (finite.sum(axis=0)[:, :, None] * np.count_nonzero(b, axis=0)[None, None, :]).reshape(m, q)
+    return u, information, nobs.astype(float)
+
+
+def _generic_scores(null, xc, finite, b):
+    """Scores and information for missing cells / several kernels via block PCG.
+
+    D'v contractions use the cached sparse trait selector (one sparse GEMM per
+    contrast, no per-column bincount loops), projections reuse W = V^-1 C when
+    cached, and design columns of several variants share one block solve.
+    """
+    n, m, c = xc.shape
+    t, r = b.shape
+    q = c * r
+    si, ti, sel = null.observed_sample, null.observed_trait, null.trait_selector
+    cells = len(si)
+    bo = b[ti]
+    u = np.empty((m, q))
+    information = np.empty((m, q, q))
+    nobs = np.empty((m, q))
+    group = max(1, int(2e7 // max(cells * c, 1)))
+    chunk = max(2 * null.rhs_block_size, 1)
+    for start in range(0, m, group):
+        vs = np.arange(start, min(start + group, m))
+        g = len(vs)
+        xo = xc[:, vs, :][si]                                  # cells x g x c
+        scores = sel @ (xo * null.py[:, None, None]).reshape(cells, g * c)
+        u[vs] = np.einsum("jk,jvc->vck", b, scores.reshape(t, g, c), optimize=True).reshape(g, q)
+        columns = np.arange(g * q)
+        for cs in range(0, len(columns), chunk):
+            col = columns[cs:cs + chunk]
+            v_of, within = col // q, col % q
+            c_of, k_of = within // r, within % r
+            projected = null.project(xo[:, v_of, c_of] * bo[:, k_of])
+            for cc in range(c):
+                rows = b.T @ (sel @ (xo[:, v_of, cc] * projected))           # r x chunk
+                information[vs[v_of][:, None], cc * r + np.arange(r)[None, :], within[:, None]] = rows.T
+        fin = finite[:, vs, :][si].astype(float)
+        nobs[vs] = np.einsum("nvc,nk->vck", fin, (bo != 0).astype(float), optimize=True).reshape(g, q)
+    return u, information, nobs
+
+
+def _finalize_scores(u, information, nobs):
+    """Coordinate, joint and omnibus statistics for all variants at once.
+
+    Batched version of the per-variant pseudoinverse: the same eigenvalue
+    tolerance as ``_psd_inverse``, estimability from the range projector and
+    natural-log tails from ``chi2_logsf``.
+    """
+    m, q = u.shape
+    information = 0.5 * (information + information.transpose(0, 2, 1))
+    w, vectors = np.linalg.eigh(information)
+    largest = np.maximum(np.max(np.abs(w), axis=1), np.finfo(float).tiny)
+    tol = max(q, 1) * np.finfo(float).eps * largest * 100
+    if np.any(np.min(w, axis=1) < -np.maximum(1e-8 * largest, tol)):
+        raise RuntimeError("score information/covariance is not positive semidefinite")
+    good = w > tol[:, None]
+    winv = np.where(good, 1.0 / np.where(good, w, 1.0), 0.0)
+    inverse = (vectors * winv[:, None, :]) @ vectors.transpose(0, 2, 1)
+    rank = good.sum(axis=1)
+    projector_diag = np.einsum("mij,mj->mi", vectors ** 2, good.astype(float))
+    diagonal = np.einsum("mii->mi", information)
+    informative = diagonal > np.maximum(diagonal.max(axis=1) * 1e-12, np.finfo(float).tiny)[:, None]
+    safe = np.where(informative, diagonal, 1.0)
+    result = {"nobs": nobs}
+    result["beta"] = np.where(informative, u / safe, np.nan)
+    result["beta_se"] = np.where(informative, 1.0 / np.sqrt(safe), np.nan)
+    result["z"] = np.where(informative, u / np.sqrt(safe), np.nan)
+    result["stat"] = result["z"] ** 2
+    result["log_p"] = chi2_logsf(result["stat"], 1)
+    result["p"] = np.exp(result["log_p"])
+    result["neglog_p"] = -result["log_p"] / np.log(10)
+    joint = np.einsum("mij,mj->mi", inverse, u)
+    joint_se = np.sqrt(np.maximum(np.einsum("mii->mi", inverse), 0.0))
+    estimable = (projector_diag > 1 - 1e-7) & (joint_se > 0)
+    result["joint_beta"] = np.where(estimable, joint, np.nan)
+    result["joint_beta_se"] = np.where(estimable, joint_se, np.nan)
+    result["conditional_stat"] = np.where(estimable, (joint / np.where(estimable, joint_se, 1.0)) ** 2, np.nan)
+    result["conditional_log_p"] = chi2_logsf(result["conditional_stat"], 1)
+    result["conditional_neglog_p"] = -result["conditional_log_p"] / np.log(10)
+    statistic = np.where(rank > 0, np.maximum(np.einsum("mi,mij,mj->m", u, inverse, u), 0.0), np.nan)
+    log_p = chi2_logsf(statistic, rank)
+    omnibus = {"stat": statistic, "dof": rank.astype(float), "log_p": log_p,
+               "neglog_p": -log_p / np.log(10), "p": np.exp(log_p)}
+    order = ("beta", "beta_se", "z", "stat", "p", "log_p", "neglog_p", "nobs", "joint_beta",
+             "joint_beta_se", "conditional_stat", "conditional_log_p", "conditional_neglog_p")
+    return {k: result[k] for k in order}, omnibus
 
 
 def score_design_block(null, designs, *, basis=None, contrast_names=None,
@@ -615,9 +841,12 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
 
     Complexity
     ----------
-    O(m c r) covariance RHS solves plus O(m (c r)^3) small information work;
-    peak working memory O(N b + (c r)^2 + m (c r)), not O(N m c r). Kernels
-    and the fixed-effect state are reused. Genotype blocks stay caller-bounded.
+    Complete phenotypes with one dense kernel use the spectral rotation: one
+    O(n^3) eigendecomposition per null (shared with the preconditioner), then
+    per block one O(n^2 m c) GEMM plus O(m c^2 t r^2 + m (c r)^3) small work,
+    with no covariance solves. Otherwise O(m c r) RHS block-PCG solves (one
+    solve per column when W = V^-1 C is cached) plus O(m (c r)^3) batched
+    information work. Genotype blocks stay caller-bounded.
     """
     import xarray as xr
     x = np.asarray(designs, dtype=np.float64)
@@ -657,79 +886,15 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
     names = indices.astype(str) if variant_names is None else np.asarray(variant_names).astype(str)
     if names.shape != (m,):
         raise ValueError("variant_names length must match variants")
-    q = c * r
-    fields = ("beta", "beta_se", "z", "stat", "p", "log_p", "neglog_p", "nobs",
-              "joint_beta", "joint_beta_se", "conditional_stat", "conditional_log_p", "conditional_neglog_p")
-    result = {key: np.full((m, q), np.nan) for key in fields}
-    omnibus = {key: np.full(m, np.nan) for key in ("stat", "dof", "log_p", "neglog_p", "p")}
-    si, ti = null.observed_sample, null.observed_trait
-    for variant in range(m):
-        xx = x[:, variant, :].copy()
-        finite = np.isfinite(xx)
-        counts = finite.sum(axis=0)
-        mean = np.divide(np.where(finite, xx, 0).sum(axis=0), counts,
-                         out=np.zeros(c), where=counts > 0)
-        xx = np.where(finite, xx - mean, 0.0)
-        # Centered genotypes may be stored/streamed as float32, but the exact
-        # information contractions and score reductions accumulate in float64.
-        xx = xx.astype(null.work_dtype).astype(np.float64)
-        def contract(values):
-            # D' values from per-trait grouped sums, without materializing D.
-            vector = values.ndim == 1
-            vv = values[:, None] if vector else values
-            out = np.empty((q, vv.shape[1]))
-            for contrast in range(c):
-                sums = np.empty((t, vv.shape[1]))
-                for col in range(vv.shape[1]):
-                    sums[:, col] = np.bincount(ti, weights=xx[si, contrast] * vv[:, col], minlength=t)
-                out[contrast * r:(contrast + 1) * r] = b.T @ sums
-            return out[:, 0] if vector else out
-        u = contract(null.py)
-        information = np.empty((q, q))
-        for start in range(0, q, null.rhs_block_size):
-            stop = min(start + null.rhs_block_size, q)
-            columns = np.arange(start, stop)
-            contrast = columns // r
-            effect = columns % r
-            design = xx[si[:, None], contrast[None, :]] * b[ti[:, None], effect[None, :]]
-            information[:, start:stop] = contract(null.project(design))
-        information = _sym(information)
-        inverse, rank, projector = _psd_inverse(information)
-        diagonal = np.diag(information)
-        max_info = np.max(diagonal, initial=0)
-        informative = diagonal > max(max_info * 1e-12, np.finfo(float).tiny)
-        result["beta"][variant, informative] = u[informative] / diagonal[informative]
-        result["beta_se"][variant, informative] = 1 / np.sqrt(diagonal[informative])
-        result["z"][variant, informative] = u[informative] / np.sqrt(diagonal[informative])
-        result["stat"][variant] = result["z"][variant] ** 2
-        lp = chi2_logsf(result["stat"][variant], 1)
-        result["log_p"][variant] = lp
-        result["p"][variant] = np.exp(lp)
-        result["neglog_p"][variant] = -lp / np.log(10)
-        # nobs counts genuinely observed genotypes and phenotype cells with a
-        # nonzero tested loading; mean imputation does not inflate this count.
-        for contrast in range(c):
-            for effect in range(r):
-                result["nobs"][variant, contrast * r + effect] = np.count_nonzero(
-                    finite[si, contrast] & (b[ti, effect] != 0))
-        estimable = np.diag(projector) > 1 - 1e-7
-        joint = inverse @ u
-        joint_se = np.sqrt(np.maximum(np.diag(inverse), 0))
-        estimable &= joint_se > 0
-        result["joint_beta"][variant, estimable] = joint[estimable]
-        result["joint_beta_se"][variant, estimable] = joint_se[estimable]
-        result["conditional_stat"][variant, estimable] = (joint[estimable] / joint_se[estimable]) ** 2
-        clp = chi2_logsf(result["conditional_stat"][variant], 1)
-        result["conditional_log_p"][variant] = clp
-        result["conditional_neglog_p"][variant] = -clp / np.log(10)
-        omnibus["dof"][variant] = rank
-        if rank:
-            statistic = max(float(u @ inverse @ u), 0.0)
-            lp = float(chi2_logsf(statistic, rank))
-            omnibus["stat"][variant] = statistic
-            omnibus["log_p"][variant] = lp
-            omnibus["neglog_p"][variant] = -lp / np.log(10)
-            omnibus["p"][variant] = np.exp(lp)
+    xc, finite = _center_designs(x, null.work_dtype)
+    spectral = _spectral_state(null)
+    if spectral is not None:
+        u, information, nobs = _spectral_scores(spectral, xc, finite, b)
+        engine_detail = "complete single-kernel spectral rotation (exact; one eigendecomposition per null)"
+    else:
+        u, information, nobs = _generic_scores(null, xc, finite, b)
+        engine_detail = "observed-space block PCG"
+    result, omnibus = _finalize_scores(u, information, nobs)
     data = {name: (("variant", "trait"), value) for name, value in result.items()}
     data.update({f"omnibus_{name}": (("variant",), value) for name, value in omnibus.items()})
     ds = xr.Dataset(data, coords={"variant": indices.astype(np.int64), "trait": np.asarray(output_names, str),
@@ -739,6 +904,7 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
         "fixed_effect_rank": int(null.fixed.shape[1]), "work_dtype": str(null.work_dtype),
         "reduction_dtype": "float64", "solver_tolerance": null.solver_tol,
         "preconditioner": null.preconditioner_details, "jitter": null.jitter,
+        "score_engine": engine_detail,
         "coordinate_test": "one-direction score; all other tested effects fixed to zero",
         "joint_estimates": "full information inverse; nonestimable coordinates are NaN",
         "null_covariance_uncertainty": "conditional on supplied G/E estimates"})

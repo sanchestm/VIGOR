@@ -1,4 +1,4 @@
-> VIGOR 2.12.1. Outputs are cleared; the notebooks were checked against the 2.12.1 API but not re-executed for this release. Current association-scan fields are described in [docs/INPUT_OUTPUT.md](../../docs/INPUT_OUTPUT.md). These notebooks need the private real26 fixture and `examples/real26_workflow.py`; the root and synthetic tutorials run without private data.
+> VIGOR 2.12.1. Outputs are cleared; the notebooks were checked against the 2.12.1 API but not re-executed for this release. These notebooks need the private real26 fixture and `examples/real26_workflow.py`; the root and synthetic tutorials run without private data.
 
 # Real26 entrypoints and source lineage
 
