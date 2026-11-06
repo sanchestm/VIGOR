@@ -11,24 +11,30 @@ def _is_plink_prefix(source):
     return not text.endswith(".zarr") and os.path.exists(text + ".bed")
 
 
-def mvGWAS(*args, engine="auto", out=None, **kwargs):
+def mvGWAS(*args, engine="fast", out=None, **kwargs):
     """Run a quantitative multivariate association scan.
 
     Parameters
     ----------
     *args : tuple
         Pipeline: (PLINK prefix, phenotype table). Multivariate: (trait table,
-        genotype source). Fast: (genotype source,) with ``state=``. Keyword
-        forms are bfile/pheno, traitdf/genotypes and genotypes/state.
-    engine : {'auto','pipeline','multivariate','fast'}
-        'pipeline' and 'multivariate' use the exact observed-space score
-        engine (one spectral rotation per null for complete phenotypes with a
-        single kernel, block PCG otherwise). 'fast' is the genome-wide
-        discovery scan of :mod:`vigor.mvgwas_fast`: one GEMM per genotype block
-        against the projected dual, calibrated with simulated null traits, with
-        optional exact rescoring of hits (``exact_rescore_fn``). Auto selects
-        pipeline for bfile or a path-like first positional argument, else
-        multivariate.
+        genotype source). Projected discovery scan: (genotype source,) with
+        ``state=``. Keyword forms are bfile/pheno, traitdf/genotypes and
+        genotypes/state.
+    engine : {'fast','exact','auto','pipeline','multivariate'}
+        'fast' (default) runs the same pipeline/multivariate scan as 'exact'
+        with the same inputs and output schema, but keeps only the score X'Py
+        exact and replaces the per-variant information D'PD by a ratio
+        approximation calibrated per chromosome against exact D'PD on a few
+        spread variants (:mod:`vigor.gwas.fast`; diagnostics in
+        ``attrs['scan_group_metadata']``). Cost is one GEMM per block instead
+        of a covariance solve per variant column. With ``state=`` it instead
+        runs the projected discovery scan of :mod:`vigor.mvgwas_fast`.
+        'exact' evaluates D'PD for every variant (spectral rotation for
+        complete phenotypes with one kernel, block PCG otherwise).
+        'auto'/'pipeline'/'multivariate' choose the route explicitly and honour
+        ``score_engine=`` (default 'fast'). Routing picks pipeline for bfile or
+        a path-like first positional argument, else multivariate.
     out : path-like, optional
         Exact engines: stream each block to Zarr v3 and return its lazy Dataset.
         Fast engine: Zarr v3 path for all scanned variants (``zarr_path``).
@@ -50,15 +56,12 @@ def mvGWAS(*args, engine="auto", out=None, **kwargs):
     ----------
     Dispatch O(1). See gwas.exact and mvgwas_fast for the scan costs.
     """
-    if engine not in {"auto", "pipeline", "multivariate", "fast"}:
-        raise ValueError("engine must be auto, pipeline, multivariate or fast")
+    if engine not in {"fast", "exact", "auto", "pipeline", "multivariate"}:
+        raise ValueError("engine must be fast, exact, auto, pipeline or multivariate")
     selected = engine
-    if selected == "fast":
+    if selected == "fast" and kwargs.get("state") is not None:
         from . import mvgwas_fast as mf
-        state = kwargs.pop("state", None)
-        if state is None:
-            raise ValueError("engine='fast' requires state=; build it per chromosome with "
-                             "vigor.mvgwas_fast.state_from_vigor_null(vigor.prepare_score_null(...))")
+        state = kwargs.pop("state")
         genotypes = args[0] if args else kwargs.pop("genotypes", None)
         if genotypes is None:
             raise ValueError("engine='fast' requires a genotype source")
@@ -72,8 +75,16 @@ def mvGWAS(*args, engine="auto", out=None, **kwargs):
             table.attrs["vigor_gwas_engine"] = "fast"
             table.attrs["vigor_score_core"] = "projected_dual_null_trait_calibrated"
         return result
+    kwargs.pop("state", None)
+    if selected in {"fast", "exact"}:
+        if "score_engine" in kwargs and kwargs["score_engine"] != selected:
+            raise ValueError(f"engine={selected!r} conflicts with score_engine={kwargs['score_engine']!r}")
+        kwargs["score_engine"] = selected
+        selected = "auto"
+    kwargs.setdefault("score_engine", "fast")
     if selected == "auto":
         selected = "pipeline" if "bfile" in kwargs or (args and isinstance(args[0], (str, os.PathLike))) else "multivariate"
+    score_engine = kwargs["score_engine"]
     if selected == "pipeline":
         from .pipeline import run_gwas
         ds = run_gwas(*args, out=out, **kwargs)
@@ -81,7 +92,8 @@ def mvGWAS(*args, engine="auto", out=None, **kwargs):
         from .multivariate import mvGWAS as scan
         ds = scan(*args, out=out, **kwargs)
     ds.attrs["vigor_gwas_engine"] = selected
-    ds.attrs["vigor_score_core"] = "observed_space_exact"
+    ds.attrs["vigor_score_core"] = ("observed_space_fast_calibrated" if score_engine == "fast"
+                                    else "observed_space_exact")
     return ds
 
 

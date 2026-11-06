@@ -807,8 +807,9 @@ def _finalize_scores(u, information, nobs):
 
 
 def score_design_block(null, designs, *, basis=None, contrast_names=None,
-                       trait_names=None, variant_indices=None, variant_names=None):
-    """Score per-locus multi-contrast designs with exact D'PD information.
+                       trait_names=None, variant_indices=None, variant_names=None,
+                       engine="exact", fast=None):
+    """Score per-locus multi-contrast designs with exact (or calibrated fast) D'PD information.
 
     Parameters
     ----------
@@ -828,6 +829,14 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
         Explicit names for basis directions, overriding DataFrame columns.
     variant_indices, variant_names : length-m sequence, optional
         Global unique integer variant indices and display labels for streaming.
+    engine : {'exact','fast'}
+        'exact' (default here) evaluates D'PD. 'fast' keeps the exact score
+        X'Py and replaces D'PD by the calibrated ratio approximation of
+        :mod:`vigor.gwas.fast` (identity basis only); the scan entry points
+        (mvGWAS, run_gwas, exact_mv_gwas) default to 'fast'.
+    fast : FastInformation, optional
+        Calibration for engine='fast'; default the one cached on ``null`` or,
+        failing that, one fitted on 32 variants of this block.
 
     Returns
     -------
@@ -886,19 +895,31 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
     names = indices.astype(str) if variant_names is None else np.asarray(variant_names).astype(str)
     if names.shape != (m,):
         raise ValueError("variant_names length must match variants")
+    if engine not in {"exact", "fast"}:
+        raise ValueError("engine must be 'exact' or 'fast'")
+    if engine == "fast" and basis is not None:
+        raise ValueError("engine='fast' supports the identity trait basis only; use engine='exact' with basis")
     xc, finite = _center_designs(x, null.work_dtype)
-    spectral = _spectral_state(null)
-    if spectral is not None:
-        u, information, nobs = _spectral_scores(spectral, xc, finite, b)
-        engine_detail = "complete single-kernel spectral rotation (exact; one eigendecomposition per null)"
+    fast_meta = None
+    if engine == "fast":
+        from .fast import fast_design_scores
+        result, omnibus, fast = fast_design_scores(null, xc, finite, fast)
+        engine_detail = ("calibrated fast information: exact score X'Py, D'PD ~ ratio-calibrated "
+                         "genotype sum of squares x pooled trait correlation")
+        fast_meta = fast.metadata()
     else:
-        u, information, nobs = _generic_scores(null, xc, finite, b)
-        engine_detail = "observed-space block PCG"
-    result, omnibus = _finalize_scores(u, information, nobs)
+        spectral = _spectral_state(null)
+        if spectral is not None:
+            u, information, nobs = _spectral_scores(spectral, xc, finite, b)
+            engine_detail = "complete single-kernel spectral rotation (exact; one eigendecomposition per null)"
+        else:
+            u, information, nobs = _generic_scores(null, xc, finite, b)
+            engine_detail = "observed-space block PCG"
+        result, omnibus = _finalize_scores(u, information, nobs)
     data = {name: (("variant", "trait"), value) for name, value in result.items()}
     data.update({f"omnibus_{name}": (("variant",), value) for name, value in omnibus.items()})
     ds = xr.Dataset(data, coords={"variant": indices.astype(np.int64), "trait": np.asarray(output_names, str),
-        "variant_id": ("variant", names)}, attrs={"engine": "exact_multivariate_score",
+        "variant_id": ("variant", names)}, attrs={"engine": "fast_multivariate_score" if engine == "fast" else "exact_multivariate_score",
         "covariance_model": "supplied full kernels and G/E; observed cells only",
         "fixed_effects": "trait-specific intercepts and supplied covariates",
         "fixed_effect_rank": int(null.fixed.shape[1]), "work_dtype": str(null.work_dtype),
@@ -911,6 +932,11 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
     ds["nobs"].attrs["description"] = "Observed phenotype cells with an observed genotype and nonzero tested loading"
     from .. import __version__
     ds.attrs["vigor_version"] = __version__
+    if fast_meta is not None:
+        ds.attrs["score_engine_mode"] = "fast"
+        ds.attrs["fast_calibration"] = fast_meta
+    else:
+        ds.attrs["score_engine_mode"] = "exact"
     for name in ("log_p", "conditional_log_p", "omnibus_log_p"):
         ds[name].attrs["units"] = "natural log probability"
     for name in ("neglog_p", "conditional_neglog_p", "omnibus_neglog_p"):
@@ -919,7 +945,7 @@ def score_design_block(null, designs, *, basis=None, contrast_names=None,
 
 
 def score_block(null, genotypes, *, basis=None, trait_names=None,
-                variant_indices=None, variant_names=None):
+                variant_indices=None, variant_names=None, engine="exact", fast=None):
     """Score an aligned sample-by-variant dosage block using score_design_block.
 
     DataFrame rows are matched by unique sample ID (exact same sample set);
@@ -947,7 +973,7 @@ def score_block(null, genotypes, *, basis=None, trait_names=None,
     if x.ndim != 2:
         raise ValueError("genotypes must be sample-by-variant")
     return score_design_block(null, x[:, :, None], basis=basis, trait_names=trait_names,
-        variant_indices=variant_indices, variant_names=variant_names)
+        variant_indices=variant_indices, variant_names=variant_names, engine=engine, fast=fast)
 
 
 __all__ = ["ExactScoreNull", "prepare_score_null", "score_block", "score_design_block", "chi2_logsf"]

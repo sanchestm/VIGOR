@@ -330,8 +330,15 @@ def exact_mv_gwas(traitdf, genotypes="genotypes/genotypes", *, GRM=None, G=None,
                   solver_tol=2e-6, solver_maxiter=400, work_dtype="float32",
                   rhs_block_size=16, preconditioner="kronecker", jitter=0.0,
                   min_maf=1e-4, maxmem=None,
-                  variant_chunk=1024, shard_variants=16384):
-    """Run exact multivariate score GWAS from array, BED, PGEN or Zarr sources.
+                  variant_chunk=1024, shard_variants=16384,
+                  score_engine="fast", fast_calibration_variants=32):
+    """Run multivariate score GWAS from array, BED, PGEN or Zarr sources.
+
+    ``score_engine='fast'`` (default) keeps the exact score X'Py and replaces
+    the per-variant information D'PD by the calibrated approximation of
+    :mod:`vigor.gwas.fast`, fitted per group against exact information on
+    ``fast_calibration_variants`` spread variants. ``'exact'`` evaluates D'PD
+    for every variant. Output schema is identical.
 
     Parameters
     ----------
@@ -389,7 +396,10 @@ def exact_mv_gwas(traitdf, genotypes="genotypes/genotypes", *, GRM=None, G=None,
     per-SNP information requires t RHS; total scan cost depends on PCG iterations.
     """
     from .exact import prepare_score_null, score_block
+    from .fast import calibrate_group
     from ..multivariate import _genetic_varcov_PSD_raw
+    if score_engine not in {"fast", "exact"}:
+        raise ValueError("score_engine must be 'fast' or 'exact'")
     Y, source, vm = scan_inputs(traitdf, genotypes, groups=groups, maxmem=maxmem)
     covariates = scan_covariates(covariates, Y.index)
     if (G is None) != (E is None):
@@ -433,9 +443,16 @@ def exact_mv_gwas(traitdf, genotypes="genotypes/genotypes", *, GRM=None, G=None,
                 solver_tol=solver_tol, solver_maxiter=solver_maxiter,
                 work_dtype=work_dtype, rhs_block_size=rhs_block_size,
                 preconditioner=preconditioner, jitter=jitter)
+            group_meta = None
+            if score_engine == "fast":
+                fast = calibrate_group(null, source, vm, Y.index, group,
+                                       n_calibration=fast_calibration_variants, block_size=block_size)
+                group_meta = {str(group): {"score_engine": "fast", **fast.metadata()}}
             for X, meta in genotype_blocks(source, vm, Y.index, group, block_size=block_size):
-                ds = attach_variant_metadata(score_block(null, X), meta, group=group)
+                ds = attach_variant_metadata(score_block(null, X, engine=score_engine), meta, group=group)
                 ds.attrs["background_source"] = "group_mapping" if background_kernels is not None else "supplied_common" if GRM is not None else "automatic_leave_group_out"
+                if group_meta is not None:
+                    ds.attrs["scan_group_metadata"] = group_meta
                 yield ds
     def blocks():
         try:

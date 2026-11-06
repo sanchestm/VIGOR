@@ -482,8 +482,9 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
              memory_budget_mb=None, grm_cache=None, n_jobs=1, resource_config=None,
              backend="cpu", progress=None, covariance_kwargs=None,
              solver_tol=2e-6, solver_maxiter=400, rhs_block_size=16,
-             variant_chunk=1024, shard_variants=16384, **retired):
-    """Run LOCO Gaussian GWAS through the common observed-space exact core.
+             variant_chunk=1024, shard_variants=16384, score_engine="fast",
+             fast_calibration_variants=32, **retired):
+    """Run LOCO Gaussian GWAS through the common observed-space score core.
 
     Parameters
     ----------
@@ -539,6 +540,15 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
         Strict PCG tolerance, iteration cap and simultaneous RHS count.
     variant_chunk, shard_variants : positive int
         Persisted chunk and enclosing shard lengths.
+    score_engine : {'fast','exact'}
+        'fast' (default): exact score X'Py with the calibrated D'PD ratio
+        approximation of vigor.gwas.fast, fitted per chromosome against exact
+        information on ``fast_calibration_variants`` spread variants; O(n c t)
+        per variant. 'exact': full D'PD (block PCG per variant column when
+        phenotypes are missing). Same output schema; per-chromosome calibration
+        diagnostics are in ``attrs['scan_group_metadata']``.
+    fast_calibration_variants : positive int
+        Exact-information variants per chromosome for the fast calibration.
     **retired : mapping
         Unsupported legacy controls fail with a migration message.
 
@@ -559,6 +569,9 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
     from .gwas.exact import prepare_score_null, score_block, score_design_block
     from .multivariate import _genetic_varcov_PSD_raw
     from .genotype_source import open_genotypes
+    from .gwas.fast import calibrate_group
+    if score_engine not in {"fast", "exact"}:
+        raise ValueError("score_engine must be 'fast' or 'exact'")
     if retired:
         raise TypeError("retired pipeline controls: " + ", ".join(sorted(retired)) +
                         "; see docs/ROUND3_MIGRATION.md")
@@ -604,7 +617,7 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
         raise ValueError("requested chromosome absent from test genotypes")
     bgsource = source if grm_bfile is None else open_genotypes(grm_bfile, maxmem=config.memory_budget_mb * 1024**2)
     bgvm = bgsource.variant_metadata.copy()
-    reporter = StageProgress(desc="Exact GWAS", enabled=bool(verbose) if progress is None else bool(progress), unit="block")
+    reporter = StageProgress(desc=f"{score_engine.capitalize()} GWAS", enabled=bool(verbose) if progress is None else bool(progress), unit="block")
     def blocks():
         try:
             with threadpool_limits(limits=config.n_jobs):
@@ -647,10 +660,17 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
                     null = prepare_score_null(Y, K, G, E, covariates=Cframe,
                         solver_tol=solver_tol, solver_maxiter=solver_maxiter,
                         rhs_block_size=rhs_block_size, work_dtype=compute_dtype)
+                    group_meta = None
+                    if score_engine == "fast":
+                        reporter.stage(f"chr {chrom}: fast calibration")
+                        fast = calibrate_group(null, source, vm, Y.index, chrom,
+                                               n_calibration=fast_calibration_variants,
+                                               block_size=block_size, model=model)
+                        group_meta = {str(chrom): {"score_engine": "fast", **fast.metadata()}}
                     for X, meta in genotype_blocks(source, vm, Y.index, chrom, block_size=block_size):
-                        reporter.stage(f"chr {chrom}: exact score / save")
+                        reporter.stage(f"chr {chrom}: {score_engine} score / save")
                         if model == "additive":
-                            ds = score_block(null, X)
+                            ds = score_block(null, X, engine=score_engine)
                         else:
                             dosage = X.to_numpy(np.float32)
                             observed = np.isfinite(dosage)
@@ -658,10 +678,13 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
                                 raise ValueError("add-dom heterozygote tests require hardcalls, not fractional dosages")
                             dom = np.where(observed, dosage == 1, np.nan).astype(np.float32)
                             ds = score_design_block(null, np.stack([dosage, dom], axis=2),
-                                                    contrast_names=["additive", "dominance"])
+                                                    contrast_names=["additive", "dominance"],
+                                                    engine=score_engine)
                         ds = attach_variant_metadata(ds, meta, group=chrom)
                         ds.attrs.update(trait_mode=trait_mode, model=model,
                             variance_estimator=variance_estimator, background="LOCO" if y_correction else "OLS")
+                        if group_meta is not None:
+                            ds.attrs["scan_group_metadata"] = group_meta
                         reporter.update()
                         yield ds
         finally:
