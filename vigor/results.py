@@ -189,6 +189,25 @@ def _json_attrs(attrs):
     return {str(k): _json_safe(v) for k, v in dict(attrs).items() if not callable(v)}
 
 
+def _zarr_text(values):
+    """Encode object arrays cell-wise, including tuple/list conditioning sets.
+
+    NumPy 2.x ``object_array.astype(str)`` can fail for tuple-valued cells;
+    JSON strings preserve structured values without changing in-memory output.
+    Time O(number of cells + serialized value length), memory O(output size).
+    """
+    import json
+    from .store import _json_safe
+    a=np.asarray(values,dtype=object)
+    cells=[]
+    for item in a.flat:
+        if isinstance(item,(dict,list,tuple,np.ndarray)):
+            cells.append(json.dumps(_json_safe(item),sort_keys=True,default=str))
+        else:
+            cells.append(str(item))
+    return np.asarray(cells,dtype=str).reshape(a.shape)
+
+
 def _storable(ds):
     """Copy with JSON-safe attrs and fixed-width string coordinates for Zarr."""
     out = ds.copy(deep=False)
@@ -197,10 +216,10 @@ def _storable(ds):
         out[name].attrs = _json_attrs(out[name].attrs)
     for key, a in out.coords.items():
         if a.dtype.kind in "OTU":
-            out = out.assign_coords({key: (a.dims, np.asarray(a.values, dtype=object).astype(str), a.attrs)})
+            out = out.assign_coords({key: (a.dims, _zarr_text(a.values), a.attrs)})
     for key, a in out.data_vars.items():
         if a.dtype.kind in "OT":
-            out[key] = (a.dims, np.asarray(a.values, dtype=object).astype(str), a.attrs)
+            out[key] = (a.dims, _zarr_text(a.values), a.attrs)
     return out
 
 

@@ -92,42 +92,82 @@ def _transform_prizes(prizes,mode='softplus_cap',cap_quantile=.995):
         cap=np.quantile(out,float(cap_quantile)) if len(out) else 0.;out=np.minimum(out,cap)
     return pd.Series(out,index=s.index),{'transform':mode,'cap_quantile':cap_quantile,'raw_max':float(np.nanmax(raw)) if len(raw) else 0,'transformed_max':float(np.nanmax(out)) if len(out) else 0}
 
-def _greedy_path_union(edges,prizes):
-    """Approximate a prize-collecting subnetwork by combining high-value paths.
+def _greedy_path_union(edges, prizes):
+    """Approximate one connected prize-collecting Steiner tree by positive-gain growth.
+
+    Unlike the earlier unconstrained union of all positive-prize nodes, every
+    selected node belongs to a single tree and each addition strictly improves
+    the prize-minus-cost objective. This is a *heuristic*; PCST optimality is
+    not guaranteed. Use ``method='pcst_fast'`` for production PCST/PCSF.
 
     Parameters
     ----------
-    edges : sequence or mapping or None
-        Graph adjacency/path specification or edge-aligned values. Node pairs must match the
-        graph's trait/gene identifiers; None imposes no optional constraint/annotation.
+    edges : pandas.DataFrame
+        Directed-looking edge rows (source,target,cost), interpreted as an
+        undirected network. Edge costs must be finite and nonnegative.
+    prizes : pandas.Series
+        Finite nonnegative vertex prizes, indexed by distinct node identifiers.
+        Nodes absent from edges are eligible as single-node solutions.
 
-    prizes : object (see the cited input contract)
-        Input for the operation ``prizes.reindex(nodes).fillna(0.0)``. See
-        ``vigor.network.pcsf._greedy_path_union`` and its caller for the scientific
-        representation; the shown operation constrains the required type/shape.
+    Returns
+    -------
+    (pandas.DataFrame, pandas.DataFrame, float)
+        Connected selected nodes/edges and objective prize sum - edge cost;
+        empty solution has objective zero.
+
+    Complexity
+    ----------
+    Up to O(R * V * (E log V + V^2)) time with R<=16 high-prize roots plus
+    one root per connected component. Memory O(V+E). Selective heuristic only.
     """
-    A,nodes,idx=edge_table_to_csr(edges);ps=prizes.reindex(nodes).fillna(0.0);term=np.flatnonzero(ps.to_numpy()>0);selected=set(term.tolist());sel_edges=set()
-    # Connect profitable terminal pairs by shortest paths; transparent baseline only.
-    for ai,i in enumerate(term[:-1]):
-        dist,pred=dijkstra(A,indices=i,directed=False,return_predecessors=True)
-        for j in term[ai+1:]:
-            if not np.isfinite(dist[j]):continue
-            benefit=float(ps.iloc[i]+ps.iloc[j]-dist[j])
-            if benefit<=0:continue
-            cur=int(j);path=[]
-            while cur!=i and cur>=0:
-                prev=int(pred[cur]);
-                if prev<0:break
-                path.append((prev,cur));cur=prev
-            if cur==i:
-                selected.update([x for e in path for x in e]);sel_edges.update(tuple(sorted(e)) for e in path)
-    nd=pd.DataFrame({'node':[nodes[i] for i in sorted(selected)],'prize':[float(ps.iloc[i]) for i in sorted(selected)]})
-    pair={(min(idx[str(r.source)],idx[str(r.target)]),max(idx[str(r.source)],idx[str(r.target)])):r for r in edges.itertuples(index=False) if str(r.source) in idx and str(r.target) in idx}
-    er=[]
-    for e in sel_edges:
-        r=pair.get(e);er.append({'source':nodes[e[0]],'target':nodes[e[1]],'cost':float(getattr(r,'cost',1.0)) if r is not None else 1.0})
-    ed=pd.DataFrame(er);cost=float(ed.cost.sum()) if len(ed) else 0.;objective=float(nd.prize.sum()-cost)
-    return nd,ed,objective
+    import networkx as nx
+    d=pd.DataFrame(edges)
+    if not {'source','target','cost'}.issubset(d.columns):
+        raise ValueError('edges must have source, target, cost columns')
+    pp=pd.Series(prizes,dtype=float).copy();pp.index=pp.index.map(str)
+    if not pp.index.is_unique or not np.isfinite(pp.to_numpy()).all() or (pp<0).any():
+        raise ValueError('vertex prizes must be unique, finite and nonnegative')
+    graph=nx.Graph();graph.add_nodes_from(pp.index)
+    for a,b,w in d[['source','target','cost']].itertuples(index=False,name=None):
+        if pd.isna(a) or pd.isna(b):raise ValueError('graph nodes cannot be missing')
+        a,b=str(a),str(b);w=float(w)
+        if not np.isfinite(w) or w<0:raise ValueError('edge costs must be finite and nonnegative')
+        if a==b:continue
+        if not graph.has_edge(a,b) or w<graph[a][b]['cost']:
+            graph.add_edge(a,b,cost=w)
+    if not graph.number_of_nodes() or not (pp>0).any():
+        return pd.DataFrame(columns=['node','prize']),pd.DataFrame(columns=['source','target','cost']),0.
+    pp=pp.reindex(sorted(graph.nodes),fill_value=0.)
+    positive=pp[pp>0].sort_values(ascending=False,kind='stable')
+    roots=list(positive.index[:16])
+    # Include the best node of each component, not only the global top-16.
+    for comp in nx.connected_components(graph):
+        best=max(comp,key=lambda v:(float(pp.loc[v]),v))
+        if pp.loc[best]>0 and best not in roots:roots.append(best)
+    best_obj=0.;best_nodes=set();best_edges=set()
+    for root in roots:
+        nodes={str(root)};tree=set()
+        while True:
+            _,paths=nx.multi_source_dijkstra(graph,nodes,weight='cost')
+            best_delta=1e-12;best_path=None
+            for dst,path in paths.items():
+                if dst in nodes:continue
+                fresh=[v for v in path if v not in nodes]
+                if not fresh:continue
+                segment={tuple(sorted((a,b))) for a,b in zip(path,path[1:])}-tree
+                delta=sum(float(pp.loc[v]) for v in fresh)-sum(float(graph[u][v]['cost']) for u,v in segment)
+                if delta>best_delta:
+                    best_delta=delta;best_path=path
+            if best_path is None:break
+            nodes.update(best_path)
+            tree.update(tuple(sorted((a,b))) for a,b in zip(best_path,best_path[1:]))
+        objective=sum(float(pp.loc[v]) for v in nodes)-sum(float(graph[u][v]['cost']) for u,v in tree)
+        if objective>best_obj+1e-12:
+            best_obj=objective;best_nodes=nodes;best_edges=tree
+    nd=pd.DataFrame([{'node':v,'prize':float(pp.loc[v])} for v in sorted(best_nodes)],columns=['node','prize'])
+    ed=pd.DataFrame([{'source':u,'target':v,'cost':float(graph[u][v]['cost'])}
+                     for u,v in sorted(best_edges)],columns=['source','target','cost'])
+    return nd,ed,float(best_obj)
 
 def _native_pcst(edges,prizes,num_clusters=1,pruning='strong'):
     """Run the optional native prize-collecting Steiner-tree solver on the prepared graph.
@@ -215,10 +255,16 @@ def prize_collecting_steiner_forest(edges,prizes,*,method='pcst_fast',prize_tran
         Computed result from ``NetworkPrioritizationResult(nd, ed, obj, method, {'prize_transform': meta}, warns)``; see the summary and the called implementation for its labeled/numerical representation.
     """
     ps=pd.Series(prizes,dtype=float);ps2,meta=_transform_prizes(ps,prize_transform,prize_cap_quantile)
-    if method in {'pcst_fast','native'}:nd,ed,obj=_native_pcst(edges,ps2,**kwargs)
-    elif method in {'greedy','legacy'}:nd,ed,obj=_greedy_path_union(edges,ps2)
-    else:raise ValueError("method must be 'pcst_fast' or 'greedy'")
     warns=[]
+    if method in {'pcst_fast','native'}:nd,ed,obj=_native_pcst(edges,ps2,**kwargs)
+    elif method in {'greedy','legacy'}:
+        n_clusters=int(kwargs.pop('num_clusters',1))
+        if n_clusters!=1:
+            raise ValueError('greedy supports one connected tree; install pcst_fast for multi-cluster PCSF')
+        if kwargs:raise ValueError('unsupported greedy options: '+','.join(sorted(kwargs)))
+        nd,ed,obj=_greedy_path_union(edges,ps2)
+        warns.append('greedy is a connected positive-gain approximation; no PCST optimality guarantee')
+    else:raise ValueError("method must be 'pcst_fast' or 'greedy'")
     if meta['raw_max']>10*max(np.nanmedian(np.abs(ps.to_numpy())),1e-12):warns.append('extreme raw prizes were saturated before optimization')
     return NetworkPrioritizationResult(nd,ed,obj,method,{'prize_transform':meta},warns)
 

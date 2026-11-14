@@ -4146,8 +4146,14 @@ def genomic_grms_from_genotypes(genotypes, *, method='vitezica', include=('addit
     from .resources import resolve_variant_chunk
     method, include = validate_grm_method(method, include)
     is_df = isinstance(genotypes, pd.DataFrame)
-    X = genotypes.to_numpy(copy=False) if is_df else np.asarray(genotypes)
-    if X.ndim != 2:
+    # Lazy sliceable sources (Dask arrays, xarray DataArrays, the packed-store view of
+    # vigor.simulate) stay lazy: blocks() below decodes one variant block at a time.
+    lazy = (not is_df and not isinstance(genotypes, np.ndarray)
+            and len(getattr(genotypes, 'shape', ())) == 2 and hasattr(genotypes, '__getitem__')
+            and (hasattr(genotypes, 'compute') or hasattr(genotypes, 'dims')
+                 or type(genotypes).__name__ == '_PackedGenotypeMatrix'))
+    X = genotypes.to_numpy(copy=False) if is_df else genotypes if lazy else np.asarray(genotypes)
+    if len(X.shape) != 2:
         raise ValueError('genotypes must be a 2D sample x variant matrix')
     ids = (pd.Index(genotypes.index.astype(str)) if is_df else
            pd.Index([str(v) for v in sample_ids]) if sample_ids is not None else None)
@@ -4166,7 +4172,10 @@ def genomic_grms_from_genotypes(genotypes, *, method='vitezica', include=('addit
     diagnostic_parts = []
     def blocks():
         for start in range(0, X.shape[1], block_variants):
-            block = np.asarray(X[:, start:start+block_variants], dtype=work_dtype)
+            block = X[:, start:start+block_variants]
+            if hasattr(block, 'compute'):
+                block = block.compute()
+            block = np.asarray(getattr(block, 'values', block) if lazy else block, dtype=work_dtype)
             if return_diagnostics:
                 fitted = block[fit]
                 observed = np.isfinite(fitted)
@@ -9005,7 +9014,10 @@ def _logbf_mvn_matrix(bhat,V,W,eps=1e-10):
 def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,L=10,coverage=.95,
                               prior_scales=(.01,.03,.10,.30),prior_weights=None,prior_mixture_weights=None,
                               max_iter=100,tol=1e-5,ld_r=None,ld_r2=None,ld_clusters=None,random_state=0,
-                              estimate_residual_scale=True,return_effects=True):
+                              estimate_residual_scale=True,return_effects=True,
+                              residual_covariance=None,covariance_shrinkage=None,covariance_floor=1e-8,
+                              residual_update_interval=1,cs_min_logbf=np.log(10.),cs_min_abs_r=.5,
+                              null_permutations=0,significance_level=.05):
     """Native multi-trait sum-of-single-effects (IBSS) fine mapper.
 
     The likelihood is fit in the generalized G/E canonical trait basis. Each single effect
@@ -9015,6 +9027,29 @@ def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,
     trait variance in the canonical basis. Returned effects retain input units.
     With supplied G/E, priors retain the supplied canonical covariance units.
     No R runtime or susieR/mvsusieR package is required.
+
+    Residual covariance is estimated jointly by default, using posterior effect
+    uncertainty and a fixed finite-sample diagonal shrinkage target. The canonical
+    transform and prior matrices stay fixed. ``residual_covariance='provided'``
+    holds the supplied E in canonical units (identity when no E is supplied);
+    ``'diagonal'`` reproduces the historical fixed total diagonal. None chooses
+    'fit' when estimate_residual_scale=True, otherwise 'provided'. Supplied G/E
+    set trait priors and units, not a sample-kinship likelihood.
+
+    covariance_shrinkage is a nonnegative pseudo-observation count (default t+1),
+    covariance_floor is a positive eigenvalue floor in fixed null-diagonal units,
+    and residual_update_interval counts complete IBSS sweeps. ``objective_trace``
+    reports the regularized centered-data ELBO; the old conditional BF trace is
+    not an objective. Nonconvergence remains explicit in the result.
+
+    ``credible_sets`` and alpha remain raw nominal results. The added
+    ``selected_credible_sets`` use component log BF >= cs_min_logbf and minimum
+    absolute LD >= cs_min_abs_r. These default screens are uncalibrated. Optional
+    null_permutations refits the entire pipeline on jointly permuted trait rows
+    and compares each component to the maximum purity-passing component evidence.
+    This gives weak familywise testing under an exchangeable GLOBAL null only;
+    relatedness and partial-null settings do not inherit that guarantee. No claim
+    of calibrated credible-set coverage or causal-gene probability is made.
 
     Parameters
     ----------
@@ -9115,7 +9150,31 @@ def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,
     dict
         Result fields: ``pip``, ``alpha``, ``credible_sets``, ``credible_set_indices``, ``coef``, ``posterior_mean_canonical``, ``canonical_basis``, ``prior_covariances``, ``prior_unit_policy``, ``prior_mixture_weights``, ``prior_weights``, ``ld_r``, ``ld_r2``, ``conditional_logbf_trace``, ``convergence_trace``, ``trace_interpretation``, ``converged``, ``n_iter``, ``x_mean``, ``x_scale``, ``y_mean``, ``version``. Field arrays preserve the corresponding input axis order.
     """
-    from scipy.special import logsumexp
+    from .finemap_ibss import fit_ibss
+    Xcheck=np.asarray(genotypes,float);Ycheck=np.asarray(traits,float)
+    if Xcheck.ndim!=2 or Ycheck.ndim not in (1,2) or len(Xcheck)!=len(Ycheck) or not Xcheck.shape[1]:
+        raise ValueError('genotypes must be n by p and traits n by t with matching rows and nonempty axes')
+    if Ycheck.ndim==2 and Ycheck.shape[1]==0:raise ValueError('traits must have at least one column')
+    if np.isinf(Xcheck).any():raise ValueError('infinite genotype dosage is not supported')
+    complete=np.isfinite(Ycheck).all(1) if Ycheck.ndim==2 else np.isfinite(Ycheck)
+    if not complete.any() or np.isnan(Xcheck[complete]).all(0).any():
+        raise ValueError('no complete phenotype rows or an entirely missing genotype column')
+    if isinstance(genotypes,pd.DataFrame) and isinstance(traits,pd.DataFrame) and not genotypes.index.equals(traits.index):
+        raise ValueError('genotype and phenotype sample labels/order must match')
+    for value,name,minimum in [(L,'L',1),(max_iter,'max_iter',1),(residual_update_interval,'residual_update_interval',1),(null_permutations,'null_permutations',0)]:
+        if not np.isscalar(value) or not np.isfinite(value) or int(value)!=value or value<minimum:
+            raise ValueError(f'{name} must be an integer >= {minimum}')
+    if not np.isfinite(tol) or tol<=0 or not 0<coverage<=1:raise ValueError('tol must be positive and coverage in (0,1]')
+    if not np.isfinite(covariance_floor) or covariance_floor<=0:raise ValueError('covariance_floor must be positive')
+    if covariance_shrinkage is not None and (not np.isfinite(covariance_shrinkage) or covariance_shrinkage<0):
+        raise ValueError('covariance_shrinkage must be a nonnegative pseudo-count')
+    if not np.isfinite(cs_min_logbf) or not 0<=cs_min_abs_r<=1 or not 0<significance_level<1:
+        raise ValueError('invalid credible-set selection controls')
+    mode=('fit' if estimate_residual_scale else 'provided') if residual_covariance is None else residual_covariance
+    if mode not in {'fit','provided','diagonal'}:raise ValueError('residual_covariance must be fit, provided or diagonal')
+    scales=np.asarray(prior_scales,float)
+    if scales.ndim!=1 or not len(scales) or not np.isfinite(scales).all() or (scales<=0).any():
+        raise ValueError('prior_scales must be a nonempty positive finite sequence')
     z=_prepare_finemap_xy(genotypes,traits);X=z['Xs'];Y=z['Y0'];n,p=X.shape;t=Y.shape[1];cb,Wlist,Wnames=_native_prior_covariances(G,E,heritability,t,prior_scales);T,Tinv=cb['transform'],cb['inverse_transform'];Yc=Y@T
     prior_unit_policy='provided_G_E_canonical_units'
     if G is None and E is None:
@@ -9126,58 +9185,78 @@ def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,
         prior_sd=np.sqrt(np.maximum(np.var(Yc,axis=0,ddof=1),1e-12))
         Wlist=[W*prior_sd[:,None]*prior_sd[None,:] for W in Wlist]
         prior_unit_policy='empirical_canonical_trait_variance_when_G_E_missing'
-    # residual variance in canonical space is nominally 1; adapt scalar over/under-dispersion from data.
-    resid_scale=np.maximum(np.nanvar(Yc,axis=0,ddof=1),1e-6) if estimate_residual_scale else np.ones(t);Ecan=np.diag(resid_scale)
-    pi=np.ones(p)/p if prior_weights is None else np.asarray(prior_weights,float);pi=np.clip(pi,0,None);pi=pi/pi.sum();lpi=np.log(np.clip(pi,1e-300,None));Q=len(Wlist);qw=np.ones(Q)/Q if prior_mixture_weights is None else np.asarray(prior_mixture_weights,float);qw=np.clip(qw,0,None);qw=qw/qw.sum();lqw=np.log(np.clip(qw,1e-300,None))
-    alpha=np.full((int(L),p),1/p,float);postmean=np.zeros((int(L),p,t));mu=np.zeros((int(L),n,t));conditional_logbf_trace=[];convergence_trace=[];converged=False
-    x2=np.sum(X*X,axis=0);x2=np.where(x2>1e-8,x2,1.)
-    for it in range(int(max_iter)):
-        aold=alpha.copy();effect_old=np.sum(alpha[:,:,None]*postmean,axis=0);pred_old=mu.sum(0).copy();ll=0.
-        fitted=mu.sum(0)
-        for ell in range(int(L)):
-            old_mu=mu[ell].copy();fitted_minus=fitted-old_mu;R=Yc-fitted_minus;bhat=(X.T@R)/x2[:,None]
-            # Standardized X makes x2 almost constant, and the native prior/residual
-            # covariances are diagonal.  Evaluate all SNPs in one vectorized update
-            # instead of millions of tiny t x t solves.  The fallback below keeps
-            # exact support for future non-diagonal priors.
-            logbfq=np.empty((p,Q));meanq=np.empty((Q,p,t))
-            diag_E=np.diag(Ecan);e_diag=np.allclose(Ecan,np.diag(diag_E),rtol=1e-12,atol=1e-14)
-            for q,W in enumerate(Wlist):
-                wd=np.diag(W);w_diag=np.allclose(W,np.diag(wd),rtol=1e-12,atol=1e-14)
-                if e_diag and w_diag:
-                    V=diag_E[None,:]/x2[:,None];VW=V+wd[None,:]
-                    logdet=.5*np.sum(np.log(V)-np.log(VW),axis=1)
-                    quad=.5*np.sum(bhat*bhat*(1.0/V-1.0/VW),axis=1)
-                    logbfq[:,q]=logdet+quad
-                    meanq[q]=bhat*(wd[None,:]/VW)
-                else:
-                    xref=float(np.median(x2)); rel=float(np.max(np.abs(x2/xref-1.0)))
-                    if rel<=1e-10:
-                        V=Ecan/xref;logbfq[:,q]=_logbf_mvn_matrix(bhat,V,W)
-                        A=W@np.linalg.solve(V+W,np.eye(t));meanq[q]=bhat@A.T
-                    else:
-                        for j in range(p):
-                            V=Ecan/x2[j];logbfq[j,q]=_logbf_mvn_matrix(bhat[j:j+1],V,W)[0];meanq[q,j]=W@np.linalg.solve(V+W,bhat[j])
-            joint=logbfq+lqw[None,:];logbf=logsumexp(joint,axis=1);gamma=np.exp(joint-logbf[:,None]);la=lpi+logbf;la-=logsumexp(la);alpha[ell]=np.exp(la);pm=np.einsum('jq,qjt->jt',gamma,meanq,optimize=True);postmean[ell]=pm;mu[ell]=X@(alpha[ell,:,None]*pm);fitted=fitted_minus+mu[ell];ll+=float(logsumexp(lpi+logbf))
-        conditional_logbf_trace.append(ll);delta=float(np.max(np.abs(alpha-aold)))
-        effect_new=np.sum(alpha[:,:,None]*postmean,axis=0)
-        effect_delta=float(np.linalg.norm(effect_new-effect_old)/max(np.linalg.norm(effect_new),1e-12))
-        prediction_delta=float(np.linalg.norm(mu.sum(0)-pred_old)/max(np.linalg.norm(mu.sum(0)),1e-12))
-        evidence_delta=(abs(ll-conditional_logbf_trace[-2])/max(1.,abs(ll)) if it else np.inf)
-        convergence_trace.append(dict(alpha_delta=delta,effect_relative_delta=effect_delta,
-                                      prediction_relative_delta=prediction_delta,conditional_logbf_relative_delta=evidence_delta))
-        if max(delta,effect_delta,prediction_delta,evidence_delta)<float(tol):
-            converged=True;break
+    if len(set(z['snps']))!=p:raise ValueError('variant labels must be unique')
+    def weights(values,names):
+        if isinstance(values,pd.Series):
+            if not values.index.is_unique:raise ValueError('prior weight labels must be unique')
+            values=values.reindex(names).to_numpy()
+        a=np.ones(len(names)) if values is None else np.asarray(values,float)
+        if a.shape!=(len(names),) or not np.isfinite(a).all() or (a<0).any() or not np.max(a)>0:
+            raise ValueError('prior weights must be finite, nonnegative, aligned and have positive mass')
+        a=a/a.max();return a/a.sum()
+    pi=weights(prior_weights,z['snps']);qw=weights(prior_mixture_weights,Wnames)
+    numeric=fit_ibss(X,Yc,Wlist,pi,qw,L=int(L),max_iter=int(max_iter),tol=float(tol),
+        residual_mode=mode,initial_covariance=cb['check_E'],covariance_shrinkage=covariance_shrinkage,
+        covariance_floor=float(covariance_floor),residual_update_interval=int(residual_update_interval))
+    alpha=numeric['alpha'];postmean=numeric['postmean']
+    conditional_logbf_trace=numeric['conditional_logbf_trace'];convergence_trace=numeric['convergence_trace']
+    converged=numeric['converged']
     pip=1-np.prod(1-alpha,axis=0);effects_can=np.sum(alpha[:,:,None]*postmean,axis=0);effects=effects_can@Tinv
-    # LD matrices for credible-set purity.
-    if ld_r is None or ld_r2 is None:
-        ldz=_compute_variant_ld_raw(pd.DataFrame(X,columns=z['snps']),statistic='both');ld_r=ldz['r'] if ld_r is None else ld_r;ld_r2=ldz['r2'] if ld_r2 is None else ld_r2
-    R=np.asarray(ld_r,float);R2=np.asarray(ld_r2,float);css=[];cs_rows=[]
+    # LD matrices for credible-set purity. Constant, uninformative variants have
+    # undefined empirical Pearson correlations; keep their identities, but treat
+    # internally computed unknown LD as zero. Explicit user-supplied NaN LD is invalid.
+    r_generated=ld_r is None; r2_generated=ld_r2 is None
+    if r_generated or r2_generated:
+        ldz=_compute_variant_ld_raw(pd.DataFrame(X,columns=z['snps']),statistic='both')
+        if r_generated:ld_r=ldz['r']
+        if r2_generated:ld_r2=ldz['r2']
+    def ld_array(value,*,generated):
+        if isinstance(value,pd.DataFrame):value=value.loc[z['snps'],z['snps']]
+        a=np.asarray(value,float)
+        if a.shape!=(p,p):raise ValueError('LD must cover all variants')
+        if generated:
+            a=np.nan_to_num(a,nan=0.0,copy=True)
+        if not np.isfinite(a).all() or not np.allclose(a,a.T,atol=1e-8):
+            raise ValueError('LD must be finite, symmetric and aligned to all variants')
+        return a
+    R=ld_array(ld_r,generated=r_generated);R2=ld_array(ld_r2,generated=r2_generated);css=[];cs_rows=[];diagnostics=[]
     for ell in range(int(L)):
         cs=credible_set_idx(alpha[ell],coverage);a=alpha[ell,cs];pur_r=R[np.ix_(cs,cs)];pur_r2=R2[np.ix_(cs,cs)];tri=np.triu_indices(len(cs),1);vr=np.abs(pur_r[tri]) if len(cs)>1 else np.array([1.]);vr2=pur_r2[tri] if len(cs)>1 else np.array([1.]);coverage_actual=float(a.sum());css.append(cs)
-        for j in cs:cs_rows.append({'effect':ell+1,'snp':z['snps'][j],'alpha':alpha[ell,j],'coverage':coverage_actual,'cs_size':len(cs),'cs_min_abs_r':float(np.nanmin(vr)),'cs_median_abs_r':float(np.nanmedian(vr)),'cs_min_r2':float(np.nanmin(vr2)),'cs_median_r2':float(np.nanmedian(vr2))})
+        purity={'cs_min_abs_r':float(np.nanmin(vr)),'cs_median_abs_r':float(np.nanmedian(vr)),'cs_min_r2':float(np.nanmin(vr2)),'cs_median_r2':float(np.nanmedian(vr2))}
+        diagnostics.append(dict(effect=ell+1,conditional_logbf=numeric['component_logbf'][ell],
+            cs_size=len(cs),coverage=coverage_actual,**purity,
+            evidence_pass=bool(numeric['component_logbf'][ell]>=cs_min_logbf),
+            purity_pass=bool(purity['cs_min_abs_r']>=cs_min_abs_r)))
+        for j in cs:cs_rows.append({'effect':ell+1,'snp':z['snps'][j],'alpha':alpha[ell,j],'coverage':coverage_actual,'cs_size':len(cs),**purity})
     pipdf=pd.DataFrame({'snp':z['snps'],'pip':pip,'posterior_effect_l2':np.sqrt(np.sum(effects*effects,axis=1))}).sort_values('pip',ascending=False);coef=pd.DataFrame(effects,index=z['snps'],columns=z['traits']);adf=pd.DataFrame(alpha,index=[f'effect{i+1}' for i in range(int(L))],columns=z['snps']);csdf=pd.DataFrame(cs_rows)
-    return {'pip':pipdf,'alpha':adf,'credible_sets':csdf,'credible_set_indices':css,'coef':coef,'posterior_mean_canonical':effects_can,'canonical_basis':cb,'prior_covariances':dict(zip(Wnames,Wlist)),'prior_unit_policy':prior_unit_policy,'prior_mixture_weights':pd.Series(qw,index=Wnames),'prior_weights':pd.Series(pi,index=z['snps']),'ld_r':ld_r,'ld_r2':ld_r2,'conditional_logbf_trace':np.asarray(conditional_logbf_trace),'convergence_trace':convergence_trace,'trace_interpretation':'sum of conditional update log Bayes factors; not a variational ELBO','converged':converged,'n_iter':len(conditional_logbf_trace),'x_mean':z['x_mean'],'x_scale':z['x_scale'],'y_mean':z['y_mean'],'version':V3_1_NATIVE_FINEMAP_VERSION}
+    diag=pd.DataFrame(diagnostics);diag['global_null_pvalue']=np.nan;null_max=[]
+    if null_permutations:
+        rng=np.random.default_rng(random_state)
+        for _ in range(int(null_permutations)):
+            perm=multitrait_bayes_finemap(pd.DataFrame(X,columns=z['snps']),Y[rng.permutation(n)],
+                G=G,E=E,heritability=heritability,L=L,coverage=coverage,prior_scales=prior_scales,
+                prior_weights=pi,prior_mixture_weights=qw,max_iter=max_iter,tol=tol,ld_r=ld_r,ld_r2=ld_r2,
+                estimate_residual_scale=estimate_residual_scale,residual_covariance=mode,
+                covariance_shrinkage=covariance_shrinkage,covariance_floor=covariance_floor,
+                residual_update_interval=residual_update_interval,cs_min_logbf=cs_min_logbf,
+                cs_min_abs_r=cs_min_abs_r,null_permutations=0)
+            d=perm['component_diagnostics'];v=d.loc[d.purity_pass,'conditional_logbf']
+            null_max.append(float(v.max()) if len(v) else -np.inf)
+        diag['global_null_pvalue']=[(1+np.count_nonzero(np.asarray(null_max)>=v))/(1+null_permutations)
+                                   for v in diag.conditional_logbf]
+    diag['selected']=diag.evidence_pass & diag.purity_pass
+    if null_permutations:diag['selected'] &= diag.global_null_pvalue<=significance_level
+    selected=diag.loc[diag.selected,'effect'].to_numpy();selected_sets=[css[i-1] for i in selected]
+    Ecan=numeric['residual_covariance'];Einput=Tinv.T@Ecan@Tinv
+    extra={k:numeric[k] for k in ('residual_covariance_trace','posterior_predictive_uncertainty',
+        'expected_residual_crossproduct','covariance_target','covariance_pseudocount','objective_trace')}
+    return {'pip':pipdf,'alpha':adf,'credible_sets':csdf,'credible_set_indices':css,'coef':coef,'posterior_mean_canonical':effects_can,'canonical_basis':cb,'prior_covariances':dict(zip(Wnames,Wlist)),'prior_unit_policy':prior_unit_policy,'prior_mixture_weights':pd.Series(qw,index=Wnames),'prior_weights':pd.Series(pi,index=z['snps']),'ld_r':ld_r,'ld_r2':ld_r2,'conditional_logbf_trace':np.asarray(conditional_logbf_trace),'convergence_trace':convergence_trace,'trace_interpretation':'sum of conditional update log Bayes factors; not a variational ELBO','converged':converged,'n_iter':len(conditional_logbf_trace),'x_mean':z['x_mean'],'x_scale':z['x_scale'],'y_mean':z['y_mean'],'version':V3_1_NATIVE_FINEMAP_VERSION,
+        'residual_covariance_mode':mode,'residual_covariance_canonical':Ecan,
+        'residual_covariance':pd.DataFrame(Einput,index=z['traits'],columns=z['traits']),
+        'component_diagnostics':diag,'selected_credible_sets':csdf.loc[csdf.effect.isin(selected)].copy(),
+        'selected_credible_set_indices':selected_sets,'null_max_logbf':np.asarray(null_max),
+        'selection_calibration':('exchangeable_global_null_permutation' if null_permutations else 'uncalibrated_bf_and_ld_screen'),
+        'complete_rows':z['rows'],'n_complete':n,**extra}
 
 
 def run_mvsusie_finemap(genotypes,traits,**kwargs):
@@ -9206,7 +9285,7 @@ def run_mvsusie_finemap(genotypes,traits,**kwargs):
         Computed result from ``multitrait_bayes_finemap(genotypes, traits, **keep)``; see the summary and the called implementation for its labeled/numerical representation.
     """
     # Translate historical wrapper-only arguments conservatively.
-    keep={k:v for k,v in kwargs.items() if k in {'G','E','heritability','prior_weights','L','coverage','prior_scales','prior_mixture_weights','max_iter','tol','ld_r','ld_r2','ld_clusters','random_state','estimate_residual_scale','return_effects'}}
+    keep={k:v for k,v in kwargs.items() if k in {'G','E','heritability','prior_weights','L','coverage','prior_scales','prior_mixture_weights','max_iter','tol','ld_r','ld_r2','ld_clusters','random_state','estimate_residual_scale','return_effects','residual_covariance','covariance_shrinkage','covariance_floor','residual_update_interval','cs_min_logbf','cs_min_abs_r','null_permutations','significance_level'}}
     return multitrait_bayes_finemap(genotypes,traits,**keep)
 
 
@@ -10003,7 +10082,12 @@ def fine_map_region(genotypes,traits,*,G=None,E=None,heritability=None,methods=(
                     coding=None,eqtl=None,xqtl=None,phewas=None,noe=None,alphagenome=None,use_evidence_priors=True,evidence_weights=None,
                     L=10,coverage=.95,random_state=0,lightgbm_kwargs=None,shap_mode='ld',compute_linear_shap=True,
                     ld=None,ld_r=None,ld_r2=None,ld_clusters=None,ld_threshold=.2,hdbscan=True,bayes_prior_scales=(.01,.03,.1,.3),sparse_group_kwargs=None,
-                    lightgbm_sparse_top_k=256):
+                    lightgbm_sparse_top_k=256,gtf_path=None,gtf_variant_metadata=None,
+                    variant_assembly=None,annotation_assembly=None,gtf_contig_aliases=None,
+                    allow_unverified_assembly=False,gtf_feature_weights=None,
+                    ld_group_prior_mode='none',bayes_kwargs=None,
+                    pcsf_export=False,pcsf_genotype_dosage_allele=None,
+                    pcsf_link_cost=0.05,pcsf_additional_links=None):
     """Final native fine mapper including LD-group sparse ElasticNet.
 
     Parameters
@@ -10177,8 +10261,57 @@ def fine_map_region(genotypes,traits,*,G=None,E=None,heritability=None,methods=(
     """
     if noe is None and isinstance(coding,pd.DataFrame) and any(str(c).startswith('NOE_') for c in coding.columns):noe=coding
     X=genotypes.copy() if isinstance(genotypes,pd.DataFrame) else pd.DataFrame(genotypes);Y=traits.copy() if isinstance(traits,pd.DataFrame) else pd.DataFrame(traits);ldz=_resolve_finemap_ld(X,ld=ld,ld_r=ld_r,ld_r2=ld_r2);clusters=(cluster_variant_ld(ldz['r2'],threshold=ld_threshold,use_hdbscan=hdbscan) if ld_clusters is None else ld_clusters.copy());evidence=evidence_prior_weights(X.columns,coding=coding,eqtl=eqtl,xqtl=xqtl,phewas=phewas,noe=noe,alphagenome=alphagenome,weights=evidence_weights) if use_evidence_priors else None;ranks=pd.DataFrame(index=X.columns.map(_normalize_snp_id));fits={};errors={}
+    # Explicit positional GTF-derived priors; annotations are not independent
+    # likelihood observations or calibrated causal-gene probabilities.
+    gene_annotations=None;gene_scores=None;pcsf_inputs=None
+    gtf_w=None
+    if pcsf_export and (gtf_path is None or gtf_variant_metadata is None):
+        raise ValueError('pcsf_export requires GTF and SNP-indexed metadata with alleles A1/A2')
+    if pcsf_export and pcsf_genotype_dosage_allele not in {'A1','A2'}:
+        raise ValueError('pcsf_genotype_dosage_allele must specify A1 or A2 explicitly')
+    if gtf_path is not None:
+        from .finemap.gtf_priors import gtf_variant_priors
+        if gtf_variant_metadata is None:
+            parsed=[str(name).replace('chr','',1).split(':') for name in X.columns]
+            if not all(len(parts)>=2 and parts[1].isdigit() for parts in parsed):
+                raise ValueError('gtf_variant_metadata is required for SNP IDs without chrom:pos')
+            vm=pd.DataFrame({'chrom':[parts[0] for parts in parsed],
+                             'pos':[int(parts[1]) for parts in parsed]},index=X.columns.astype(str))
+        else:
+            vm=gtf_variant_metadata.copy()
+            vm.index=vm.index.astype(str)
+            if not vm.index.is_unique or not vm.index.isin(X.columns.astype(str)).all() or len(vm)!=len(X.columns):
+                raise ValueError('gtf_variant_metadata must uniquely align with genotype columns')
+            vm=vm.reindex(X.columns.astype(str))
+        gene_annotations=gtf_variant_priors(vm,gtf_path,variant_assembly=variant_assembly,
+            annotation_assembly=annotation_assembly,contig_aliases=gtf_contig_aliases,
+            allow_unverified_assembly=allow_unverified_assembly,feature_weights=gtf_feature_weights)
+        gtf_w=gene_annotations.prior_weight.to_numpy(float)
+    if ld_group_prior_mode not in {'none','equal_group'}:
+        raise ValueError('ld_group_prior_mode must be none or equal_group')
     if 'bayes' in methods or 'mvsusie' in methods:
-        pw=None if evidence is None else evidence['prior_weights'].reindex(ranks.index).to_numpy();z=multitrait_bayes_finemap(X,Y,G=G,E=E,heritability=heritability,prior_weights=pw,L=L,coverage=coverage,prior_scales=bayes_prior_scales,ld_r=ldz['r'],ld_r2=ldz['r2'],ld_clusters=clusters,random_state=random_state);fits['bayes']=z;ranks['bayes_pip']=z['pip'].assign(snp=lambda d:d.snp.map(_normalize_snp_id)).set_index('snp').pip
+        from .finemap.gtf_priors import equal_ld_group_prior,gene_interval_scores
+        pw=np.ones(X.shape[1]) if evidence is None else evidence['prior_weights'].reindex(ranks.index).to_numpy(float)
+        if gtf_w is not None:pw=pw*gtf_w
+        if ld_group_prior_mode=='equal_group':
+            group_labels=clusters.reindex(X.columns.astype(str)).ld_group
+            pw=equal_ld_group_prior(pw,group_labels)
+        pw=pw/pw.sum()
+        extra_kw={} if bayes_kwargs is None else dict(bayes_kwargs)
+        z=multitrait_bayes_finemap(X,Y,G=G,E=E,heritability=heritability,
+            prior_weights=pw,L=L,coverage=coverage,prior_scales=bayes_prior_scales,
+            ld_r=ldz['r'],ld_r2=ldz['r2'],ld_clusters=clusters,
+            random_state=random_state,**extra_kw)
+        fits['bayes']=z
+        ranks['bayes_pip']=z['pip'].assign(snp=lambda d:d.snp.map(_normalize_snp_id)).set_index('snp').pip
+        if gene_annotations is not None:
+            gene_scores=gene_interval_scores(z['pip'].set_index('snp').pip,gene_annotations)
+            ranks['gtf_prior']=pd.Series(gtf_w,index=X.columns.astype(str)).rename_axis(None).reindex(ranks.index).to_numpy()
+            if pcsf_export:
+                from .integration.finemap_pcsf import finemap_pcsf_inputs
+                pcsf_inputs=finemap_pcsf_inputs(z,X,vm,gene_annotations,
+                    genotype_dosage_allele=pcsf_genotype_dosage_allele,
+                    link_cost=pcsf_link_cost,additional_links=pcsf_additional_links)
     for key,fun,col in [('ridge',multitrait_ridge_finemap,'ridge_l2'),('elasticnet',multitrait_elasticnet_finemap,'elasticnet_l2')]:
         if key in methods:
             try:z=fun(X,Y,G=G,E=E,heritability=heritability,random_state=random_state,shap_mode=shap_mode,compute_shap=compute_linear_shap);fits[key]=z;r=z['ranking'].assign(snp=lambda d:d.snp.map(_normalize_snp_id)).set_index('snp');ranks[key]=r[col];ranks[key+'_shap']=r.mean_abs_shap if 'mean_abs_shap' in r else np.nan
@@ -10199,7 +10332,7 @@ def fine_map_region(genotypes,traits,*,G=None,E=None,heritability=None,methods=(
     if evidence is not None:
         ev=evidence['evidence_score'].rank(pct=True).reindex(ranks.index).fillna(0.);ranks=ranks.join(evidence['components'],how='left').join(evidence['prior_weights'].rename('evidence_prior'),how='left');ranks['consensus_score']=.85*stat+.15*ev
     else:ranks['consensus_score']=stat
-    return {'ranking':ranks.sort_values('consensus_score',ascending=False),'fits':fits,'evidence':evidence,'ld':ldz,'ld_source':ldz.get('source','unknown'),'ld_signed_r_available':bool(ldz.get('signed_r_available',True)),'ld_clusters':clusters,'ld_cluster_summary':summarize_ld_clusters(clusters,ldz['r2']),'errors':errors,'version':V3_1_NATIVE_FINEMAP_VERSION}
+    return {'ranking':ranks.sort_values('consensus_score',ascending=False),'fits':fits,'evidence':evidence,'ld':ldz,'ld_source':ldz.get('source','unknown'),'ld_signed_r_available':bool(ldz.get('signed_r_available',True)),'ld_clusters':clusters,'ld_cluster_summary':summarize_ld_clusters(clusters,ldz['r2']),'errors':errors,'version':V3_1_NATIVE_FINEMAP_VERSION,'gene_annotations':gene_annotations,'gene_scores':gene_scores,'gtf_assembly_unverified':(gene_annotations is not None and not bool(gene_annotations.assembly_verified.iloc[0])),'ld_group_prior_mode':ld_group_prior_mode,'pcsf_inputs':pcsf_inputs}
 
 # ============================================================================
 # v3.1.4 native fine-mapping evidence adapters

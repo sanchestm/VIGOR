@@ -932,7 +932,7 @@ class GenomicSimulationResult:
         for the result-axis/value contract. Default: a fresh value from ``dict()`` for each
         instance.
     """
-    genotypes: pd.DataFrame
+    genotypes: pd.DataFrame | None  # None when genotypes live in a packed Zarr store
     phenotypes: pd.DataFrame
     components: dict[str, pd.DataFrame]
     trait_covariances: dict[str, pd.DataFrame]
@@ -961,6 +961,10 @@ class GenomicSimulationResult:
             Computed result from ``p``; see the summary and the called implementation for its labeled/numerical representation.
         """
         from .testutils import write_plink
+        if self.genotypes is None:
+            raise ValueError("this simulation keeps its genotypes in a packed Zarr store "
+                             f"({self.metadata.get('genotype_store')!r}); pass that path to the "
+                             "genotype APIs instead of writing PLINK")
         p = str(prefix)
         vi = self.variant_info.reindex(self.genotypes.columns)
         write_plink(p, self.genotypes.to_numpy(float), list(map(str, self.genotypes.index)),
@@ -1015,7 +1019,7 @@ class GenomicSimulationResult:
                              dim=dim).assign_coords({dim: list(frames)})
 
         vi = self.variant_info
-        if not vi.index.equals(self.genotypes.columns):
+        if self.genotypes is not None and not vi.index.equals(self.genotypes.columns):
             vi = vi.reindex(self.genotypes.columns)
         values = {
             "genotypes": self.genotypes, "phenotypes": self.phenotypes,
@@ -1284,8 +1288,16 @@ def simulate_traits_from_genotypes(
     # Memory: the genotype matrix is wrapped without a float64 copy; allele
     # frequencies are computed in bounded float32 blocks and A/D codings are
     # built only for the loci used by the architecture (B3/B12.4).
-    Gdf = _as_frame(genotypes, prefix="v", copy=False)
-    X = Gdf.to_numpy(copy=False)
+    if isinstance(genotypes, _PackedGenotypeMatrix):
+        # Packed 2-bit Zarr store: every read below decodes bounded column blocks,
+        # so no dense animals x variants matrix exists and none is returned.
+        Gdf = None
+        X = genotypes
+        sample_index, variant_names = genotypes.index, genotypes.columns
+    else:
+        Gdf = _as_frame(genotypes, prefix="v", copy=False)
+        X = Gdf.to_numpy(copy=False)
+        sample_index, variant_names = Gdf.index, Gdf.columns
     if not np.issubdtype(X.dtype, np.floating):
         X = X.astype(np.float32)
     n, m = X.shape; T = int(n_traits)
@@ -1384,7 +1396,7 @@ def simulate_traits_from_genotypes(
         epi_components[kind] += base_pen * locus
         epi_penetrance[kind] += (gate[:, None] - base_pen) * locus
         epi_rows.append({"pair_id": pair_id, "kind": kind,
-                         "snp1": Gdf.columns[j], "snp2": Gdf.columns[k],
+                         "snp1": variant_names[j], "snp2": variant_names[k],
                          "variant1": int(j), "variant2": int(k),
                          "base_penetrance": base_pen,
                          **{f"effect_{traits[t]}": float(beta[t]) for t in range(T)}})
@@ -1412,7 +1424,7 @@ def simulate_traits_from_genotypes(
                 GxE_explicit_hidden += term
             else:
                 GxE_explicit_observed += term
-            gxe_rows.append({"snp": Gdf.columns[j], "variant_index": int(j),
+            gxe_rows.append({"snp": variant_names[j], "variant_index": int(j),
                              "environment": f"hidden{eidx+1}" if use_hidden else f"observed{eidx+1}",
                              "hidden": bool(use_hidden), "coding": coding,
                              **{f"effect_{traits[t]}": float(beta[t]) for t in range(T)}})
@@ -1476,7 +1488,7 @@ def simulate_traits_from_genotypes(
     Etotal = sum(envc.values(), np.zeros((n, T)))
     Y = Gtotal + Etotal
 
-    idx = Gdf.index
+    idx = sample_index
     components = {k: pd.DataFrame(v, index=idx, columns=traits) for k, v in {**genetic, **envc}.items()}
     components["GxE_penetrance"] = pd.DataFrame(gxe_pen_scaled, index=idx, columns=traits)
     components["GxE_hidden"] = pd.DataFrame(gxe_hidden_scaled, index=idx, columns=traits)
@@ -1501,7 +1513,7 @@ def simulate_traits_from_genotypes(
             if BA[j, t] == 0 and BD[j, t] == 0:
                 continue
             rows.append({
-                "snp": Gdf.columns[j], "variant_index": int(j), "trait": tr,
+                "snp": variant_names[j], "variant_index": int(j), "trait": tr,
                 "af": float(p[j]), "maf": float(min(p[j], 1-p[j])),
                 "additive_effect_raw": float(BA[j, t]),
                 "dominance_effect_raw": float(BD[j, t]),
@@ -1586,7 +1598,7 @@ def simulate_traits_from_genotypes(
         "maf_effect_alpha": float(maf_effect_alpha), "penetrance_range": tuple(map(float, penetrance_range)),
         "truth_definition": "covariances are empirical covariances of realized mechanistic components; no G/E covariance matrix was supplied to the simulator",
     }
-    vi = pd.DataFrame({"af": p, "maf": np.minimum(p,1-p)}, index=Gdf.columns)
+    vi = pd.DataFrame({"af": p, "maf": np.minimum(p,1-p)}, index=variant_names)
     return GenomicSimulationResult(
         genotypes=Gdf, phenotypes=phenotypes, components=components,
         trait_covariances=covs, variant_info=vi,
@@ -1801,6 +1813,7 @@ def simulate_genotypes_to_zarr(
     seed: int | None = 0,
     overwrite: bool = False,
     pack_hardcalls: bool = True,
+    variant_chunk: int | None = None,
 ):
     """Simulate a large genotype panel chromosome by chromosome straight to a Zarr v3 store.
 
@@ -1844,6 +1857,12 @@ def simulate_genotypes_to_zarr(
 
     pack_hardcalls : bool
         Store hard calls as packed 2-bit bytes (``GT_packed2``). Default: ``True``.
+
+    variant_chunk : int or None
+        Stored variant chunk (and write window). None uses the largest chromosome, so one
+        chunk holds a chromosome. Smaller values (e.g. 4096) make single-column and window
+        reads cheap; the two-chromosome cache keeps each chromosome simulated only once.
+        Default: ``None``.
 
     Returns
     -------
@@ -1907,8 +1926,9 @@ def simulate_genotypes_to_zarr(
                 "chromosome": ("variant", chrom.astype(object)),
                 "position": ("variant", positions.astype(np.int64))},
     )
+    chunk = int(per.max()) if variant_chunk is None else max(4, int(variant_chunk))
     out = write_genotype_zarr(dset, path, pack_hardcalls=pack_hardcalls,
-                              variant_chunk=int(per.max()), overwrite=overwrite)
+                              variant_chunk=chunk, overwrite=overwrite)
     cache.clear()
     return out
 
@@ -2020,6 +2040,270 @@ def simulate_from_zarr(path, *, sample_ids=None, max_variants=None, n_traits=12,
                     "max_variants": None if max_variants is None else int(max_variants)}), save_path)
 
 
+class _PackedGenotypeMatrix:
+    """Read-only sample x variant view of a VIGOR genotype Zarr store, decoded on demand.
+
+    Supports ``X[rows, columns]`` with an integer, slice, integer array or boolean mask
+    on the variant axis; every access decodes only the touched 2-bit chunks to float32
+    (NaN = missing). ``shape``, ``ndim``, ``dtype``, ``index`` (sample IDs), ``columns``
+    (variant IDs), ``chromosome`` and ``position`` mirror a labeled dosage matrix, so the
+    blockwise simulation and GRM code can consume it without materializing n x M values.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Genotype Zarr store (``GT_packed2`` or ``GT``), e.g. from :func:`simulate_genotypes_to_zarr`.
+    sample_ids : sequence of str or None
+        Samples to keep, in output order. None keeps every sample in store order.
+    """
+
+    def __init__(self, path, sample_ids=None):
+        from .data_model import open_genotype_dataset
+        ds = open_genotype_dataset(str(path), source_format="zarr")
+        if "GT" not in ds:
+            raise ValueError("genotype store has no hard-call GT variable")
+        gt = ds["GT"].transpose("sample", "variant")
+        ids = _string_labels(gt["sample"].values)
+        if sample_ids is not None:
+            want = _string_labels(sample_ids)
+            rows = pd.Index(ids).get_indexer(want)
+            if np.any(rows < 0):
+                raise KeyError(f"genotype store is missing requested sample(s): {want[rows < 0][:5].tolist()}")
+            gt = gt.isel(sample=rows)
+            ids = want
+        self._gt = gt
+        self.path = str(path)
+        self.index = pd.Index(ids)
+        self.columns = pd.Index(_string_labels(gt["variant"].values))
+        self.chromosome = (_string_labels(gt["chromosome"].values).astype(str)
+                           if "chromosome" in gt.coords else None)
+        self.position = (np.asarray(gt["position"].values).astype(np.int64)
+                         if "position" in gt.coords else None)
+        self.shape = (len(self.index), len(self.columns))
+        self.ndim = 2
+        self.dtype = np.dtype(np.float32)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise IndexError("index packed genotypes as X[rows, columns]")
+        rows, cols = key
+        squeeze = isinstance(cols, (int, np.integer))
+        if squeeze:
+            j = int(cols) + (self.shape[1] if int(cols) < 0 else 0)
+            if not 0 <= j < self.shape[1]:
+                raise IndexError("variant index out of range")
+            sel = slice(j, j + 1)
+        elif isinstance(cols, slice):
+            sel = cols
+        else:
+            sel = np.asarray(cols)
+            if sel.dtype == bool:
+                sel = np.flatnonzero(sel)
+        out = np.asarray(self._gt.isel(variant=sel).values, dtype=np.float32)
+        if not (isinstance(rows, slice) and rows == slice(None)):
+            out = out[rows]
+        return out[:, 0] if squeeze else out
+
+
+_PACKED_GENOTYPE_KEYS = ("model", "n_founders", "chromosome_length_mb", "recombination_rate_cM_per_mb",
+                         "generations", "founder_af_beta", "min_founder_mac", "missing_rate")
+
+
+def _packed_store_record(path):
+    """The ``vigor_packed_cohort`` parameter record of a store, or None."""
+    try:
+        import zarr
+        return dict(zarr.open_group(str(path), mode="r").attrs.get("vigor_packed_cohort") or {}) or None
+    except Exception:
+        return None
+
+
+def simulate_packed_cohort(path, n_samples: int = 1000, n_variants: int = 5000,
+                           n_chromosomes: int = 4, n_traits: int = 12, *,
+                           genotype_kwargs: Mapping[str, Any] | None = None,
+                           trait_kwargs: Mapping[str, Any] | None = None,
+                           seed: int | None = 0, variant_chunk: int = 4096,
+                           overwrite: bool = False, save_path=None):
+    """Simulate a cohort whose genotypes live only in a 2-bit packed Zarr store.
+
+    Genotypes are written once with :func:`simulate_genotypes_to_zarr`
+    (``pack_hardcalls=True``: 0.25 byte per call on disk, one chromosome at a time
+    in memory). A store at ``path`` written earlier with the same genotype
+    parameters is reused, so several notebooks or runs share one store. Traits are
+    then simulated by :func:`simulate_traits_from_genotypes` straight from the store:
+    allele frequencies and GRMs are accumulated over bounded decoded blocks and only
+    the causal/epistatic/GxE columns are decoded individually. No dense animals x
+    variants matrix is built, and none is returned.
+
+    Pass the store path to the genotype APIs (``vigor.grm``, ``vigor.GRMs``,
+    ``vigor.build_grms``, ``vigor.mvGWAS(Y, genotypes=path)``, ``vigor.factorGWAS``,
+    ``vigor.open_genotypes``) and use :func:`genotype_panel` for a bounded dense window.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Genotype store directory (``.zarr``).
+    n_samples, n_variants, n_chromosomes : int
+        Cohort size; variants are split evenly over chromosomes (>= 2 per chromosome).
+    n_traits : int
+        Number of simulated traits. Default: ``12``.
+    genotype_kwargs : mapping or None
+        Genotype model options of :func:`simulate_genotypes_to_zarr`: ``model``,
+        ``n_founders``, ``chromosome_length_mb``, ``recombination_rate_cM_per_mb``,
+        ``generations``, ``founder_af_beta``, ``min_founder_mac``, ``missing_rate``.
+        ``n_chromosomes`` here overrides the argument of the same name.
+    trait_kwargs : mapping or None
+        Options of :func:`simulate_traits_from_genotypes` (e.g. a
+        :func:`simulation_scenario` preset). ``compute_grms=True`` attaches the
+        additive/dominance GRMs (O(n^2) memory).
+    seed : int or None
+        Master seed, split between genotypes and traits as in
+        :func:`simulate_genomic_dataset`. Default: ``0``.
+    variant_chunk : int
+        Stored variant chunk; small chunks keep column and window reads cheap.
+        Default: ``4096``.
+    overwrite : bool
+        Rewrite the store. Without it, an existing store with different genotype
+        parameters raises ``FileExistsError``. Default: ``False``.
+    save_path : str or os.PathLike or None
+        Optional .zarr path for the returned result. Default: ``None``.
+
+    Returns
+    -------
+    xarray.Dataset
+        As :func:`simulate_genomic_dataset` but without the ``genotypes`` variable or
+        ``founders``: ``phenotypes``, ``components``, ``trait_covariances``,
+        ``environment``, ``grms`` (when computed), ``variant_info``
+        (``chrom``/``pos``/``af``/``maf``) and effect tables. ``attrs['genotype_store']``
+        is the store path; ``attrs['metadata']['genotype_store_reused']`` says whether an
+        existing store was reused.
+
+    Notes
+    -----
+    Peak memory: writing holds about two chromosome blocks of float32; trait
+    simulation holds one ~256 MiB decoded block, the n x n_causal codings and, with
+    GRMs, the n x n kernels. Disk: ``n_samples * n_variants / 4`` bytes.
+    """
+    import json
+    gkw = dict(genotype_kwargs or {})
+    n_chromosomes = int(gkw.pop("n_chromosomes", n_chromosomes))
+    unknown = sorted(set(gkw) - set(_PACKED_GENOTYPE_KEYS))
+    if unknown:
+        raise TypeError(f"unsupported genotype_kwargs for a packed cohort: {unknown}; "
+                        f"allowed: {list(_PACKED_GENOTYPE_KEYS)}")
+    sg, st = np.random.SeedSequence(seed).spawn(2)
+    gseed = int(sg.generate_state(1)[0]); tseed = int(st.generate_state(1)[0])
+    record = json.loads(json.dumps({
+        "n_samples": int(n_samples), "n_variants": int(n_variants),
+        "n_chromosomes": int(n_chromosomes), "genotype_seed": gseed,
+        "variant_chunk": int(variant_chunk), "genotype_kwargs": gkw}, default=float))
+    store = Path(path)
+    reused = store.exists() and not overwrite
+    if reused:
+        existing = _packed_store_record(store)
+        if existing != record:
+            raise FileExistsError(f"{store} holds a different or incomplete genotype simulation "
+                                  f"({existing}); pass overwrite=True or another path")
+    else:
+        simulate_genotypes_to_zarr(int(n_samples), int(n_variants), n_chromosomes, store,
+                                   seed=gseed, overwrite=overwrite, pack_hardcalls=True,
+                                   variant_chunk=int(variant_chunk), **gkw)
+        import zarr
+        zarr.open_group(str(store), mode="a").attrs["vigor_packed_cohort"] = record
+        zarr.consolidate_metadata(str(store))
+    G = _PackedGenotypeMatrix(store)
+    res = simulate_traits_from_genotypes(G, n_traits=n_traits, seed=tseed, **dict(trait_kwargs or {}))
+    vi = pd.DataFrame(index=G.columns)
+    if G.chromosome is not None:
+        vi["chrom"] = G.chromosome
+    if G.position is not None:
+        vi["pos"] = G.position
+    for c in res.variant_info.columns:
+        vi[c] = res.variant_info[c].to_numpy()
+    res.variant_info = vi
+    res.metadata.update({"genotype": record, "master_seed": seed, "genotype_store": str(store),
+                         "genotype_store_reused": bool(reused),
+                         "genotype_encoding": "GT_packed2, 2 bits per call"})
+    ds = res.to_dataset(
+        software="vigor.simulate.simulate_packed_cohort",
+        parameters={"path": str(store), "n_samples": int(n_samples), "n_variants": int(n_variants),
+                    "n_chromosomes": int(n_chromosomes), "n_traits": int(n_traits), "seed": seed})
+    ds.attrs["genotype_store"] = str(store)
+    return maybe_save(ds, save_path)
+
+
+def genotype_panel(path, *, chromosome=None, start=None, stop=None, variants=None,
+                   max_variants=None, sample_ids=None):
+    """Decode a bounded window of a genotype store into a labeled float32 DataFrame.
+
+    Use it where a routine genuinely needs a dense matrix (fine mapping of one
+    region, feature construction, LD of a window); pass the store path itself to
+    APIs that stream genotypes.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Genotype Zarr store (packed or not) or anything :func:`vigor.open_genotype_dataset`
+        reads as Zarr.
+    chromosome : str or None
+        Keep one chromosome. Default: ``None``.
+    start, stop : int or None
+        Physical position bounds in bp (inclusive start, exclusive stop), applied
+        after ``chromosome``. Default: ``None``.
+    variants : slice, int array or sequence of variant IDs, or None
+        Positional selection within the filtered variants, or explicit IDs.
+        Default: ``None``.
+    max_variants : int or None
+        Evenly spaced cap on the selected variants. Default: ``None``.
+    sample_ids : sequence of str or None
+        Samples to keep, in order. Default: every sample.
+
+    Returns
+    -------
+    pandas.DataFrame
+        animals x selected variants, float32 dosages with NaN missing; memory
+        ``4 * n_samples * n_selected`` bytes.
+    """
+    G = _PackedGenotypeMatrix(path, sample_ids=sample_ids)
+    idx = np.arange(G.shape[1])
+    if chromosome is not None:
+        if G.chromosome is None:
+            raise ValueError("genotype store has no chromosome coordinate")
+        idx = idx[G.chromosome[idx] == str(chromosome)]
+    if start is not None or stop is not None:
+        if G.position is None:
+            raise ValueError("genotype store has no position coordinate")
+        pos = G.position[idx]
+        keep = np.ones(len(idx), bool)
+        if start is not None:
+            keep &= pos >= int(start)
+        if stop is not None:
+            keep &= pos < int(stop)
+        idx = idx[keep]
+    if variants is not None:
+        if isinstance(variants, slice):
+            idx = idx[variants]
+        else:
+            v = np.asarray(variants)
+            if v.dtype.kind in "iu":
+                idx = idx[v]
+            else:
+                pos = G.columns.get_indexer(v.astype(str))
+                if np.any(pos < 0):
+                    raise KeyError(f"unknown variant IDs: {v[pos < 0][:5].tolist()}")
+                idx = pos[np.isin(pos, idx)]
+    if max_variants is not None and len(idx) > int(max_variants):
+        idx = idx[np.unique(np.linspace(0, len(idx) - 1, int(max_variants)).round().astype(int))]
+    if len(idx) and idx[-1] - idx[0] + 1 == len(idx) and np.all(np.diff(idx) == 1):
+        X = G[:, slice(int(idx[0]), int(idx[-1]) + 1)]
+    else:
+        X = G[:, idx]
+    return pd.DataFrame(X, index=G.index, columns=G.columns[idx], copy=False)
+
+
 def write_simulation_plink(sim, prefix):
     """Write a simulation's genotypes as a PLINK1 BED/BIM/FAM fileset.
 
@@ -2039,6 +2323,10 @@ def write_simulation_plink(sim, prefix):
     """
     if isinstance(sim, GenomicSimulationResult):
         return sim.write_plink(prefix)
+    if "genotypes" not in sim:
+        raise ValueError("this simulation keeps its genotypes in a packed Zarr store "
+                         f"({sim.attrs.get('genotype_store')!r}); pass that path to the "
+                         "genotype APIs instead of writing PLINK")
     from .results import result_table
     from .testutils import write_plink
     g = sim["genotypes"].transpose("sample", "variant")
@@ -2121,4 +2409,5 @@ __all__ = [
     "simulate_traits_from_genotypes", "simulate_genomic_dataset",
     "simulate_from_plink1", "simulation_scenario",
     "simulate_genotypes_to_zarr", "simulate_from_zarr",
+    "simulate_packed_cohort", "genotype_panel",
 ]

@@ -1,5 +1,6 @@
 """LOCO factor effect-subspace scans through the exact multivariate score core."""
 import warnings
+from collections.abc import Mapping
 import numpy as np
 import pandas as pd
 from . import multivariate as mv
@@ -129,41 +130,89 @@ def _residualize(Y, covariates):
     return fitY
 
 
-def _group_dual(fitY, K, G, E, null_solver_kwargs):
-    """Observed-space mvBLUP dual V^-1(y - mu) for one background, animals x traits.
+def _group_plan(fitY, K, G, E, null_solver_kwargs):
+    """Prepared observed-space mvBLUP plan for one background (same settings as mvPredict).
 
-    Zero on unobserved cells. ``A @ L`` gives the exact factor-score directions:
-    the score of loading vector l for a centered genotype x is x'(A l).
+    The plan is reused for the real dual and every null-trait dual, so the
+    operator and preconditioner are built once per exclusion group.
     """
-    opts = dict(null_solver_kwargs or {})
     names = fitY.columns
     frame = lambda m: pd.DataFrame(np.asarray(m, float), index=names, columns=names)
     Gf = {k: frame(v) for k, v in G.items()} if isinstance(G, dict) else frame(G)
-    state = mv._mvPredict_raw(fitY, K, Gf, frame(E), return_state=True,
-                              solver_tol=float(opts.get("solver_tol", 1e-6)),
-                              solver_maxiter=int(opts.get("solver_maxiter", 1000)), progress=False)
-    return state["A"].reindex(index=fitY.index, columns=names).to_numpy(float)
+    accuracy = "fast" if len(fitY) >= 1024 else "exact"
+    return mv.prepare_mvBLUP_plan(fitY, K, Gf, frame(E), center=True, accuracy=accuracy,
+                                  kernel_rank="full", progress=False)
 
 
-def _grammar_gamma(null, calibration, active, sigma, L):
-    """Per-factor gamma = median(exact information / (x'x sigma_kk)) over calibration variants."""
-    from .gwas.exact import score_design_block
-    if len(calibration) < 10:
-        warnings.warn(f"only {len(calibration)} polymorphic calibration variants; gamma set to 1",
-                      RuntimeWarning, stacklevel=3)
-        return np.ones(L.shape[1]), len(calibration)
-    X = np.column_stack(calibration).astype(np.float64)
-    exact = score_design_block(null, X[:, :, None], basis=L)
-    info = 1.0 / exact["beta_se"].values ** 2
-    a = X[active]
-    finite = np.isfinite(a)
-    counts = finite.sum(axis=0)
-    mean = np.divide(np.where(finite, a, 0.0).sum(axis=0), counts, out=np.zeros(a.shape[1]), where=counts > 0)
-    xc = np.where(finite, a - mean, 0.0)
-    ols = np.einsum("ij,ij->j", xc, xc)[:, None] * np.diag(sigma)[None, :]
-    ratio = np.where(np.isfinite(info) & (ols > 0), info / np.where(ols > 0, ols, 1.0), np.nan)
-    gamma = np.nanmedian(np.where(ratio > 0, ratio, np.nan), axis=0)
-    return np.where(np.isfinite(gamma) & (gamma > 0), gamma, 1.0), X.shape[1]
+def _plan_dual(plan, frame, null_solver_kwargs, *, check_against_plan=False):
+    """Dual V^-1(y - ybar) on observed cells (animals x traits, zero elsewhere).
+
+    ``frame`` must have the plan's observed-cell pattern. Cells follow the plan's
+    sample-major ``flat`` order, the order of its operator and solution.
+    """
+    opts = dict(null_solver_kwargs or {})
+    tol = float(opts.get("solver_tol", 1e-6))
+    Yv = frame.to_numpy(float)
+    means = np.nanmean(Yv, axis=0)
+    Yv = Yv - np.where(np.isfinite(means), means, 0.0)[None, :]
+    flat = plan.obs_plan["flat"]
+    rhs = np.nan_to_num(Yv.ravel()[flat])
+    if check_against_plan and "y" in plan.obs_plan and not np.allclose(np.asarray(plan.obs_plan["y"], float), rhs,
+                                               rtol=1e-4, atol=1e-4 * max(1.0, float(np.abs(rhs).max()))):
+        raise RuntimeError("mvBLUP plan cell order differs from the flat (animal, trait) order")
+    alpha, info = plan.solve(y=rhs, rtol=tol, maxiter=int(opts.get("solver_maxiter", 1000)))
+    if info["cg_info"] != 0 or info["cg_relative_residual"] > max(20 * tol, 2e-5):
+        raise RuntimeError(f"factorGWAS null PCG did not converge: {info}")
+    A = np.zeros(plan.n * plan.t)
+    A[flat] = alpha
+    return A.reshape(plan.n, plan.t)
+
+
+def _psd_root(M):
+    """Symmetric PSD square root (handles singular trait covariances without jitter)."""
+    M = np.asarray(M, float)
+    w, V = np.linalg.eigh(0.5 * (M + M.T))
+    return (V * np.sqrt(np.clip(w, 0.0, None))) @ V.T
+
+
+def _kernel_root(K, jitter=1e-6):
+    """Lower float32 Cholesky factor of a dense kernel, raising jitter until it succeeds."""
+    from scipy.linalg import cholesky
+    base = np.asarray(K, np.float32)
+    scale = max(float(np.mean(np.diag(base))), np.finfo(np.float32).tiny)
+    for k in range(6):
+        work = np.array(base, dtype=np.float32, copy=True)
+        work[np.diag_indices_from(work)] += np.float32(jitter * 10 ** k * scale)
+        try:
+            return cholesky(work, lower=True, overwrite_a=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            continue
+    raise np.linalg.LinAlgError("background kernel is not positive semidefinite within jitter")
+
+
+def _null_trait_frames(fitY, K, G, E, covariates, reps, seed):
+    """Simulated null phenotype sets y0 ~ N(0, sum_k K_k (x) G_k + I (x) E).
+
+    Drawn on the full grid, then masked to ``fitY``'s observed cells and
+    covariate-residualized exactly like the real phenotypes.
+    """
+    rng = np.random.default_rng(seed)
+    n, t = fitY.shape
+    if isinstance(G, dict):
+        if not isinstance(K, Mapping):
+            raise ValueError("multi-component G requires named background kernels")
+        pairs = [(K[name], G[name]) for name in G]
+    else:
+        pairs = [(K, G)]
+    roots = [(_kernel_root(Kk), _psd_root(Gk).astype(np.float32)) for Kk, Gk in pairs]
+    Er = _psd_root(E).astype(np.float32)
+    observed = fitY.notna().to_numpy()
+    for _ in range(int(reps)):
+        y0 = rng.standard_normal((n, t), dtype=np.float32) @ Er
+        for Lk, Rg in roots:
+            y0 += Lk @ (rng.standard_normal((n, t), dtype=np.float32) @ Rg)
+        y0 = np.where(observed, y0.astype(np.float64), np.nan)
+        yield _residualize(pd.DataFrame(y0, index=fitY.index, columns=fitY.columns), covariates)
 
 
 def _factor_dataset(result, omnibus, meta, cols):
@@ -194,19 +243,22 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
                block_size=128, chromosomes=None, random_state=0,
                null_solver_kwargs=None, covariates=None, out=None, projection_out=None,
                max_return_rows=2_000_000, variant_chunk=1024, shard_variants=16384,
-               maxmem=None, gamma_snps=200, gamma_scope="auto", rescore_p=1e-5,
-               rescore_max=5000, **retired):
+               maxmem=None, null_reps=4, rescore_p=None, rescore_max=5000, **retired):
     """Test LOCO factor effect directions in the full-trait Gaussian null.
 
     The default ``method='grammar_gamma'`` is the fast genome-wide mode. Per
     exclusion group it computes the observed-space mvBLUP dual A = V^-1(y - mu)
     with the LOCO kernel, so the factor scores u = x'(A L) are exact (including
     missing phenotype cells); only the information x'Px is approximated by
-    x'x * S, where S is the factor-score covariance rescaled per factor by
-    gamma = median(exact information / x'x S_kk) over ``gamma_snps`` strided
-    variants. Variants whose approximate joint test passes ``rescore_p`` are
-    rescored with the exact engine (``exact_rescored`` marks them). Covariance
-    and axes are estimated once (``loco_factor='fixed'``) unless 'refit' is set.
+    x'x * S. The r x r matrix S is calibrated in factor space from ``null_reps``
+    simulated null trait sets y0 ~ N(0, K (x) G + I (x) E): their duals A0 are
+    solved with the same prepared plan, and their factor scores u0 = x'(A0 L),
+    computed in the same GEMM as the real scores, have covariance x'P_L x. So
+    S = sum u0 u0' / sum x'x over every variant of the group; no exact
+    information model is built. A held-out replicate gives a lambda check
+    (``null_lambda`` in ``scan_group_metadata``). Optional exact rescoring of
+    hits (``rescore_p``) marks ``exact_rescored``. Covariance and axes are
+    estimated once (``loco_factor='fixed'``) unless 'refit' is set.
     ``method='exact'`` scores every variant with the exact engine.
 
     Parameters
@@ -229,15 +281,16 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
     background : {'loco','provided'}
         Construct leave-group-out backgrounds or require supplied kernels.
     method : {'grammar_gamma', 'exact'}
-        'grammar_gamma' (default): exact scores, gamma-calibrated information and
-        exact rescoring of hits. 'exact': exact information for every variant.
+        'grammar_gamma' (default): exact scores and information x'x S with S
+        calibrated from null-trait duals. 'exact': exact information for every
+        variant.
     score_method : {'direct','subspace'}
         Restrict beta_trait=L beta_factor in the full original-trait null.
     heterogeneity : bool, optional
         Also report nested full-trait minus factor-subspace score statistic.
         This requires full-trait exact information and can be expensive. Default
         True for 'exact'; False for 'grammar_gamma', where True reports it for the
-        exact-rescored variants only.
+        exact-rescored variants only and therefore requires ``rescore_p``.
     loco_factor : {'refit','fixed'}, optional
         'refit' re-estimates covariance and axes per excluded chromosome. 'fixed'
         keeps one set of axes. Default 'fixed' for 'grammar_gamma' (one covariance
@@ -260,9 +313,10 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
     block_size : positive int or 'auto'
         Source/scoring block length.
     random_state : int
-        Covariance fit seed.
+        Covariance fit seed; also seeds the null trait draws (per group).
     null_solver_kwargs : mapping, optional
-        prepare_score_null options; e.g. solver_tol, solver_maxiter, rhs_block_size.
+        Solver options; solver_tol and solver_maxiter apply to the grammar_gamma
+        mvBLUP duals, all keys to prepare_score_null (exact mode and rescoring).
     covariates : sample by covariate frame/array, optional
         Additional fixed effects; per-trait intercepts are mandatory.
     out : path, optional
@@ -278,14 +332,15 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         Persisted chunk and shard lengths.
     maxmem : memory size, optional
         Genotype source block budget.
-    gamma_snps : positive int
-        Variants per group, taken by stride, used to estimate gamma. Default 200.
-    gamma_scope : {'auto', 'group', 'first'}
-        Estimate gamma per group ('group'), once on the first group ('first'),
-        or per group only when the exact information is cheap, i.e. complete
-        phenotypes and one dense kernel ('auto').
-    rescore_p : float
-        Approximate joint p-value below which variants are rescored exactly.
+    null_reps : int >= 1
+        Simulated null trait sets per group for calibrating S (grammar_gamma).
+        Each costs one extra PCG solve with the group's prepared plan and widens
+        the scan GEMM by r columns. Default 4; with >= 2 one replicate is held
+        out to report ``null_lambda``.
+    rescore_p : float or None
+        Opt-in exact rescoring: approximate joint p-value below which variants
+        are rescored with the exact engine (builds an exact null per group with
+        hits). Default None (no rescoring).
     rescore_max : positive int
         Maximum candidate genotype columns cached per group for rescoring.
     **retired : mapping
@@ -300,9 +355,11 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
 
     Complexity
     ----------
-    grammar_gamma: one mvBLUP solve per group, one O(n m r) GEMM per block and
-    exact scoring of ``gamma_snps`` plus the rescored variants; per-group results
-    (m x r) are held until gamma is known. exact: per-group covariance fit plus
+    grammar_gamma: one plan and 1 + null_reps PCG solves per group, one Cholesky
+    of the LOCO kernel (O(n^3/3)) for the null draws, one O(n m r (1+null_reps))
+    GEMM per block; per-group results (m x r(1+null_reps)) are held until S is
+    known. Automatic LOCO kernels use one genome-wide pass plus each group's own
+    variants. Rescoring, when requested, adds exact work per hit. exact: per-group covariance fit plus
     exact information for every variant (O(m r) solves, or one GEMM per block
     for complete phenotypes and one dense kernel); heterogeneity adds O(m t).
     """
@@ -332,8 +389,14 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         raise ValueError("native factor directions cannot be restandardized")
     if genotypes is None:
         raise ValueError("genotypes are required")
-    if gamma_scope not in {"auto", "group", "first"}:
-        raise ValueError("gamma_scope must be 'auto', 'group' or 'first'")
+    if isinstance(null_reps, bool) or int(null_reps) != null_reps or null_reps < 1:
+        raise ValueError("null_reps must be a positive integer")
+    null_reps = int(null_reps)
+    if rescore_p is not None and not 0 < float(rescore_p) < 1:
+        raise ValueError("rescore_p must be None or in (0, 1)")
+    if fast and heterogeneity and rescore_p is None:
+        raise ValueError("grammar_gamma reports heterogeneity only for exact-rescored variants; "
+                         "set rescore_p or use method='exact'")
     if projection_out is not None and out is not None:
         association_path = str(out) if str(out).endswith('.zarr') else str(out) + '.zarr'
         if Path(projection_out).resolve() == Path(association_path).resolve():
@@ -467,76 +530,95 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
             yield group_attrs(attach_variant_metadata(ds, meta, group=group), group, L, psi)
 
     def grammar_group(group, K, G, E, L, psi):
-        """GRAMMAR-Gamma factor scan of one exclusion group (see factorGWAS Notes)."""
+        """GRAMMAR-Gamma factor scan of one exclusion group with null-trait calibration of S."""
+        from scipy.stats import chi2
         names = pd.Index(Y.columns)
         cols = [f"factor{i+1}" for i in range(nfac)]
-        dual = _group_dual(fitY, K, G, E, null_solver_kwargs)
+        plan = _group_plan(fitY, K, G, E, null_solver_kwargs)
+        dual = _plan_dual(plan, fitY, null_solver_kwargs, check_against_plan=True)
+        seed = np.random.SeedSequence([int(random_state), labels.index(group)])
+        null_duals = [_plan_dual(plan, y0, null_solver_kwargs)
+                      for y0 in _null_trait_frames(fitY, K, G, E, covariates, null_reps, seed)]
         active = Y.notna().any(axis=1).to_numpy()
-        observed = Y.notna().to_numpy()[active].astype(float)
-        Z = dual[active] @ L                                     # exact factor score directions
-        Zc = Z - Z.mean(axis=0)
+        # Per-factor observation counts: (finite' observed) loaded == finite' (observed loaded),
+        # an n x r product instead of an n x t one.
+        obs_loaded = (Y.notna().to_numpy()[active].astype(np.float32)
+                      @ (L != 0).astype(np.float32))
+        # Real and null factor-score directions share one GEMM per block.
+        Zall = np.concatenate([d[active] @ L for d in [dual, *null_duals]], axis=1)
+        Zall -= Zall.mean(axis=0)
+        Zc = Zall[:, :nfac]
+        Zall32 = np.asarray(Zall, np.float32)
         sigma = Zc.T @ Zc / max(int(active.sum()), 1)
         sigma_inv = np.linalg.pinv(sigma, rcond=1e-10)
-        loaded = (L != 0).astype(float)
-        n_group = int((vm.chromosome.astype(str).to_numpy() == str(group)).sum())
-        stride = max(1, n_group // max(int(gamma_snps), 1))
-        stored, calibration, candidates = [], [], []
-        seen = 0
+        R = null_reps
+        num = np.zeros((R, nfac, nfac))
+        den = 0.0
+        stored, candidates = [], []
         for X, meta in genotype_blocks(source, vm, Y.index, group, block_size=block_size):
             X = coded(X)
             raw = X.to_numpy(np.float32)
-            a = raw[active].astype(np.float64)
+            a = raw[active]
             finite = np.isfinite(a)
             counts = finite.sum(axis=0)
-            mean = np.divide(np.where(finite, a, 0.0).sum(axis=0), counts, out=np.zeros(a.shape[1]), where=counts > 0)
-            xc = np.where(finite, a - mean, 0.0)
-            u = xc.T @ Zc
-            xx = np.einsum("ij,ij->j", xc, xc)
-            nobs = (finite.astype(float).T @ observed) @ loaded
-            pick = np.flatnonzero(((seen + np.arange(a.shape[1])) % stride == 0) & (xx > 0))
-            for j in pick[:max(int(gamma_snps) - len(calibration), 0)]:
-                calibration.append(raw[:, j].copy())
-            # Provisional statistic with gamma = 1 keeps a bounded cache of
-            # candidate genotypes for exact rescoring once gamma is known.
-            provisional = np.einsum("mi,ij,mj->m", u, sigma_inv, u) / np.where(xx > 0, xx, np.inf)
-            for j in np.flatnonzero(provisional >= rescore_cache_stat):
-                candidates.append((provisional[j], len(stored), j, raw[:, j].copy()))
-            if len(candidates) > rescore_max:
-                candidates.sort(key=lambda c: -c[0])
-                del candidates[rescore_max:]
-            stored.append((meta, u, xx, nobs))
-            seen += a.shape[1]
+            mean = np.divide(np.where(finite, a, 0).sum(axis=0, dtype=np.float64), counts,
+                             out=np.zeros(a.shape[1]), where=counts > 0).astype(np.float32)
+            xc = np.where(finite, a - mean[None, :], np.float32(0))
+            scores = np.asarray(xc.T @ Zall32, np.float64)
+            u = scores[:, :nfac]
+            u0 = scores[:, nfac:].reshape(len(meta), R, nfac)
+            xx = np.einsum("ij,ij->j", xc, xc, dtype=np.float64)
+            nobs = np.asarray(finite.T.astype(np.float32) @ obs_loaded, np.float64)
+            good = xx > 0
+            num += np.einsum("mki,mkj->kij", u0[good], u0[good], optimize=True)
+            den += float(xx[good].sum())
+            if rescore_p is not None:
+                # Provisional statistic (S not yet known) keeps a bounded candidate cache.
+                provisional = np.einsum("mi,ij,mj->m", u, sigma_inv, u) / np.where(good, xx, np.inf)
+                for j in np.flatnonzero(provisional >= rescore_cache_stat):
+                    candidates.append((provisional[j], len(stored), j, raw[:, j].copy()))
+                if len(candidates) > rescore_max:
+                    candidates.sort(key=lambda c: -c[0])
+                    del candidates[rescore_max:]
+            stored.append((meta, u, xx, nobs, u0))
         if not stored:
             return
-        # gamma: per group when exact information is cheap (spectral null); otherwise
-        # estimated on the first group and reused (it varies little across LOCO groups).
-        null = None
-        if "gamma" in shared:
-            gamma, gamma_n = shared["gamma"], shared["gamma_n"]
-        else:
-            null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
-            gamma, gamma_n = _grammar_gamma(null, calibration, active, sigma, L)
-            if gamma_scope == "first" or (gamma_scope == "auto" and _spectral_state(null) is None):
-                shared.update(gamma=gamma, gamma_n=gamma_n)
-        root = np.sqrt(gamma)
-        S = sigma * root[:, None] * root[None, :]
+        if den <= 0:
+            raise ValueError(f"group {group!r} has no polymorphic variants to calibrate S")
+        S_reps = num / den
+        S = S_reps.mean(axis=0)
         Sinv = np.linalg.pinv(S, rcond=1e-10)
-        threshold = rescore_stat_threshold(nfac)
+        # Held-out check: S from the other replicates, lambda on the left-out one.
+        lambdas = []
+        if R >= 2:
+            for k in range(R):
+                S_out = np.delete(S_reps, k, axis=0).mean(axis=0)
+                w = np.linalg.eigvalsh(S_out)
+                rank = max(1, int(np.sum(w > w.max() * 1e-10)))
+                Si = np.linalg.pinv(S_out, rcond=1e-10)
+                Q = np.concatenate([np.einsum("mi,ij,mj->m", u0b[xxb > 0, k], Si, u0b[xxb > 0, k]) / xxb[xxb > 0]
+                                    for _, _, xxb, _, u0b in stored])
+                lambdas.append(float(np.median(Q) / chi2.ppf(.5, rank)))
         rescore = {}
-        final = []
-        for _, bi, row, column in candidates:
-            u_row, xx_row = stored[bi][1][row], stored[bi][2][row]
-            if xx_row > 0 and float(u_row @ Sinv @ u_row) / xx_row >= threshold:
-                final.append((bi, row, column))
-        if final:
-            if null is None:
+        if rescore_p is not None:
+            threshold = rescore_stat_threshold(nfac)
+            final = [(bi, row, column) for _, bi, row, column in candidates
+                     if stored[bi][2][row] > 0
+                     and float(stored[bi][1][row] @ Sinv @ stored[bi][1][row]) / stored[bi][2][row] >= threshold]
+            if final:
                 null = prepare_score_null(Y, K, G, E, covariates=covariates, **dict(null_solver_kwargs or {}))
-            Xh = np.column_stack([c[2] for c in final]).astype(np.float64)
-            exact = score_design_block(null, Xh[:, :, None], basis=pd.DataFrame(L, index=names, columns=cols))
-            full = score_design_block(null, Xh[:, :, None]) if heterogeneity else None
-            for k, (bi, row, _) in enumerate(final):
-                rescore.setdefault(bi, []).append((row, k))
-        for bi, (meta, u, xx, nobs) in enumerate(stored):
+                Xh = np.column_stack([c[2] for c in final]).astype(np.float64)
+                exact = score_design_block(null, Xh[:, :, None], basis=pd.DataFrame(L, index=names, columns=cols))
+                full = score_design_block(null, Xh[:, :, None]) if heterogeneity else None
+                for k, (bi, row, _) in enumerate(final):
+                    rescore.setdefault(bi, []).append((row, k))
+        extra = {"calibration": "null-trait duals in factor space", "null_reps": int(R),
+                 "S_diagonal": np.diag(S).tolist(),
+                 "null_lambda": float(np.median(lambdas)) if lambdas else None,
+                 "null_lambda_by_rep": lambdas,
+                 "rescore_p": None if rescore_p is None else float(rescore_p),
+                 "exact_rescored": int(sum(len(v) for v in rescore.values()))}
+        for bi, (meta, u, xx, nobs, _) in enumerate(stored):
             info = xx[:, None, None] * S[None]
             result, omnibus = _finalize_scores(u, info, nobs)
             ds = _factor_dataset(result, omnibus, meta, cols)
@@ -554,30 +636,30 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
                     ds["q_snp"].values[row] = stat[0]; ds["q_snp_dof"].values[row] = dof[0]
                     ds["q_snp_log_p"].values[row] = logp[0]; ds["q_snp_neglog_p"].values[row] = -logp[0] / np.log(10)
             ds.attrs.update(engine="grammar_gamma_factor_score",
-                            information="x'x * S, S = factor-score covariance rescaled per factor by gamma "
-                                        "(median exact/OLS information ratio); variants above the rescore "
-                                        "threshold use the exact engine")
-            yield group_attrs(attach_variant_metadata(ds, meta, group=group), group, L, psi,
-                              {"gamma": np.asarray(gamma).tolist(), "gamma_snps": int(gamma_n),
-                               "rescore_p": float(rescore_p),
-                               "exact_rescored": int(sum(len(v) for v in rescore.values()))})
+                            information="x'x * S; S = sum u0 u0' / sum x'x over the group's variants, "
+                                        "u0 = null-trait factor scores with covariance x'P_L x")
+            yield group_attrs(attach_variant_metadata(ds, meta, group=group), group, L, psi, extra)
 
     def rescore_stat_threshold(dof):
         from scipy.stats import chi2
         return float(chi2.isf(rescore_p, dof))
 
     rescore_cache_stat = None
+    # One genome pass builds every automatic LOCO kernel when several groups are scanned.
+    loco_cache = {} if len(labels) > 1 else None
 
     def blocks():
         nonlocal rescore_cache_stat
         from scipy.stats import chi2
-        # Cache candidates generously (gamma is not yet known); rescore the strict set.
-        rescore_cache_stat = float(chi2.isf(min(rescore_p * 1e3, 1.0), nfac))
+        # Cache candidates generously (S is not yet known); rescore the strict set.
+        if rescore_p is not None:
+            rescore_cache_stat = float(chi2.isf(min(float(rescore_p) * 1e3, 1.0), nfac))
         try:
             for group in labels:
                 K = background_for_group(source, vm, Y.index, group, kernels=GRM,
                     background_kernels=background_kernels, background=background, block_size=block_size,
-                    compute_dtype=dict(null_solver_kwargs or {}).get('work_dtype', 'float32'))
+                    compute_dtype=dict(null_solver_kwargs or {}).get('work_dtype', 'float32'),
+                    loco_cache=loco_cache)
                 G, E, L, psi, view = model_for_group(K)
                 if projection_out is not None:
                     projection_state(group, L, psi, view)

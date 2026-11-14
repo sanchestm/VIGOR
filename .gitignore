@@ -23,3 +23,6 @@ benchmarks/cache/
 benchmarks/results/*.scan.execution.json
 
 .local-release/
+
+# Packed genotype stores written by the synthetic tutorials
+vigor_tutorial_data/

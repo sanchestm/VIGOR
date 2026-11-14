@@ -182,15 +182,70 @@ def covariance_matrices(result):
     return G, np.asarray(view["E"])
 
 
+def _additive_numerator(source, vm, samples, select, *, block_size, min_maf, compute_dtype):
+    """Unnormalized VanRaden numerator Z Z' and weight sum(2pq) over selected variants.
+
+    Returns (numerator float32 n x n, weight) or (None, 0.0) when nothing is
+    polymorphic. VanRaden 'van' kernels are num / sum(2pq) with per-variant
+    centering, so numerators and weights add across disjoint variant sets.
+    """
+    from ..grm_backend import grm_from_blocks
+    def blocks():
+        for block, physical in validated_source_blocks(source, vm, samples, block_size=block_size):
+            mask = select[physical]
+            if mask.any():
+                yield np.asarray(block.data[:, mask], dtype=np.float32)
+    try:
+        out, weights, _ = grm_from_blocks(blocks(), len(samples), method="van",
+                                          components=("additive",), min_maf=min_maf,
+                                          dtype=compute_dtype, output_dtype=np.float32)
+    except ValueError as exc:
+        if "no polymorphic variants" in str(exc):
+            return None, 0.0
+        raise
+    weight = float(weights["additive"])
+    numerator = out["additive"]
+    numerator *= np.float32(weight)
+    return numerator, weight
+
+
+def _loco_from_cache(cache, source, vm, samples, group, *, block_size, min_maf, compute_dtype):
+    """LOCO kernel (N_total - N_group) / (w_total - w_group) with one genome pass in total.
+
+    The genome-wide numerator is accumulated once per scan and kept in
+    ``cache``; each group then only multiplies its own variants, so building all
+    LOCO kernels costs O(n^2 M) instead of O(n^2 M) per group.
+    """
+    labels = vm.chromosome.astype(str).to_numpy()
+    if "total" not in cache:
+        cache["total"] = _additive_numerator(source, vm, samples, np.ones(len(vm), bool),
+            block_size=block_size, min_maf=min_maf, compute_dtype=compute_dtype)
+    total, wtot = cache["total"]
+    if total is None:
+        raise ValueError("LOCO has no polymorphic background variants")
+    own, wown = _additive_numerator(source, vm, samples, labels == str(group),
+        block_size=block_size, min_maf=min_maf, compute_dtype=compute_dtype)
+    weight = wtot - wown
+    if weight <= 0:
+        raise ValueError("LOCO has no background variants; supply an independent kernel")
+    # Reuse the group's buffer: peak memory is two n x n float32 matrices.
+    out = total.copy() if own is None else np.subtract(total, own, out=own)
+    out /= np.float32(weight)
+    return out.astype(compute_dtype, copy=False)
+
+
 def background_for_group(source, vm, samples, group, *, kernels=None,
                          background_kernels=None, background="loco",
-                         block_size="auto", min_maf=1e-4, compute_dtype=np.float32):
+                         block_size="auto", min_maf=1e-4, compute_dtype=np.float32,
+                         loco_cache=None):
     """Resolve a declared background or construct exact leave-group-out GRM.
 
     ``background_kernels`` maps exclusion groups to kernels (or named kernel
     collections); ``kernels`` is a common explicitly supplied background. For
     automatic construction all variants of the tested group are excluded.
     A canonical chromosome GRM store is supported via ``kernels=path``.
+    ``loco_cache`` (a dict reused across the groups of one scan) builds the
+    genome-wide numerator once and subtracts each group's own variants.
 
     Returns
     -------
@@ -223,6 +278,9 @@ def background_for_group(source, vm, samples, group, *, kernels=None,
     keep = vm.chromosome.astype(str).to_numpy() != str(group)
     if not keep.any():
         raise ValueError("LOCO has no background variants; supply an independent kernel")
+    if loco_cache is not None:
+        return _loco_from_cache(loco_cache, source, vm, samples, group, block_size=block_size,
+                                min_maf=min_maf, compute_dtype=compute_dtype)
     from ..grm_backend import grm_from_blocks
     def blocks():
         for block, physical in validated_source_blocks(source, vm, samples, block_size=block_size):
@@ -412,11 +470,13 @@ def exact_mv_gwas(traitdf, genotypes="genotypes/genotypes", *, GRM=None, G=None,
         labels = requested
     if len(set(labels)) != len(labels):
         raise ValueError("requested exclusion groups must be unique")
+    loco_cache = {} if len(labels) > 1 else None
     def scan_blocks():
         for group in labels:
             K = background_for_group(source, vm, Y.index, group, kernels=GRM,
                 background_kernels=background_kernels, background=background,
-                block_size=block_size, min_maf=min_maf, compute_dtype=work_dtype)
+                block_size=block_size, min_maf=min_maf, compute_dtype=work_dtype,
+                loco_cache=loco_cache)
             if G is None:
                 kw = dict(covariance_kwargs or {})
                 kw.setdefault("n_boot", 0)

@@ -617,6 +617,8 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
         raise ValueError("requested chromosome absent from test genotypes")
     bgsource = source if grm_bfile is None else open_genotypes(grm_bfile, maxmem=config.memory_budget_mb * 1024**2)
     bgvm = bgsource.variant_metadata.copy()
+    # One genome pass builds every LOCO kernel when several chromosomes are scanned.
+    loco_cache = {} if len(labels) > 1 else None
     reporter = StageProgress(desc=f"{score_engine.capitalize()} GWAS", enabled=bool(verbose) if progress is None else bool(progress), unit="block")
     def blocks():
         try:
@@ -632,7 +634,8 @@ def run_gwas(bfile, pheno, traits=None, covar=None, model="add-dom", chroms=None
                         E = np.diag(np.nanvar(fitY.to_numpy(float), axis=0, ddof=C.shape[1]))
                     else:
                         K = background_for_group(bgsource, bgvm, Y.index, chrom, kernels=grm_cache,
-                                                  block_size=block_size, compute_dtype=compute_dtype)
+                                                  block_size=block_size, compute_dtype=compute_dtype,
+                                                  loco_cache=loco_cache)
                         if trait_mode == "multivariate":
                             kw = dict(covariance_kwargs or {})
                             kw.setdefault("n_boot", 0); kw.setdefault("progress", False)

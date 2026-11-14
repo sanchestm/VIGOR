@@ -25,3 +25,24 @@ own project inputs: copy `examples/project_config.py` to `<project>/vigor_run/pr
 and edit its paths; the notebooks find it from their working directory or its parents
 (or set `VIGOR_PROJECT_ROOT`). Historical
 filenames containing 2_11_4 describe notebook lineage; the code targets VIGOR 2.12.1.
+
+## Packed synthetic genotypes
+
+The root and `synthetic/` routes simulate genotypes with `vigor.simulate_packed_cohort`.
+It writes them once to a 2-bit packed Zarr store (`GT_packed2`, 0.25 byte per call) under
+`./vigor_tutorial_data/`. Later notebooks with the same genotype parameters reuse that store.
+Traits are simulated from bounded decoded blocks. The returned Dataset has phenotypes,
+truth components, GRMs and `variant_info`, but no dense `genotypes` variable.
+
+The notebooks pass the store path (`GENO`) to the APIs that stream genotypes: `vigor.grm`,
+`vigor.build_grms`, `vigor.mvGWAS(Y, genotypes=GENO)`, `vigor.factorGWAS` and
+`vigor.effective_tests(vigor.open_genotypes(GENO))`. Two routes still need a dense matrix,
+so they decode only a bounded window with `vigor.genotype_panel`:
+
+- 05 builds expert SNP features from an evenly spaced panel (`max_variants=1000`).
+- 08 fine-maps one 120-variant region.
+
+To try a larger cohort on a small machine, raise `n_samples`/`n_variants` in the setup cell.
+Disk grows as `n_samples * n_variants / 4` bytes. Memory is dominated by the n × n GRMs; pass
+`compute_grms=False` in `trait_kwargs` if you do not need them. Delete `vigor_tutorial_data/`
+to regenerate the store.

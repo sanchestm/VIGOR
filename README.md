@@ -192,10 +192,15 @@ gwas = vigor.factorGWAS(
 How the default `method='grammar_gamma'` works:
 - **Scores.** Factor scores are exact: they come from the LOCO mvBLUP dual, and missing
   cells are handled.
-- **Information.** It is x'x·S, with S rescaled per factor by γ. γ is the median ratio to
-  the exact information over about 200 strided variants per chromosome.
-- **Hits.** Variants passing `rescore_p` (default 1e-5) are rescored with the exact engine
-  and flagged in `exact_rescored`.
+- **Information.** It is x'x·S. The r×r matrix S is calibrated in factor space per
+  chromosome from `null_reps=4` simulated null trait sets, solved with the same mvBLUP plan
+  and scored in the same GEMM as the real data, so S uses every variant and no exact
+  information model is built. A held-out replicate gives `null_lambda` in
+  `attrs['scan_group_metadata']`.
+- **Hits.** Exact rescoring is opt-in: variants passing `rescore_p` (default None) are
+  rescored with the exact engine and flagged in `exact_rescored`.
+- **LOCO kernels.** Built from one genome-wide pass; each chromosome then subtracts only its
+  own variants.
 - **Covariance.** G, E and the axes are estimated once, or taken from `decomposition`,
   rather than refitted per chromosome.
 
@@ -203,12 +208,34 @@ Other modes:
 - `method='exact'` scores every variant with the exact engine.
 - `loco_factor='refit'` re-estimates covariance and factors per chromosome group.
 
+### Fine mapping and gene networks
+
+```python
+fm = vigor.fine_map_region(X, Y, methods=('bayes',), L=4,
+                           gtf_path='genes.gtf.gz', gtf_variant_metadata=bim,   # chrom, pos, A1, A2
+                           annotation_assembly='GRCr8', variant_assembly='GRCr8',
+                           pcsf_export=True, pcsf_genotype_dosage_allele='A2')
+fm.metadata['gene_scores'], fm.metadata['pcsf_inputs']['variant_nodes']
+```
+
+- **Residual covariance.** The native multi-trait IBSS now estimates the full trait residual
+  covariance, including posterior effect uncertainty, with light shrinkage toward the null
+  diagonal (`residual_covariance='fit'`, the default). `'diagonal'` restores the old behaviour.
+- **Credible sets.** Raw sets are kept. `selected_credible_sets` adds a screen (log BF ≥ log 10
+  and min |r| ≥ 0.5); it is not a calibrated test unless `null_permutations` is set.
+- **GTF priors.** Optional CDS/exon/gene-body prior weights and per-gene PIP summaries.
+  Gene scores are rankings, not causal-gene probabilities, and assemblies must match.
+- **PCSF export.** SNP PIPs become prizes; GTF overlaps, plus any eQTL/regulatory links you
+  pass in `pcsf_additional_links`, become SNP→gene edges. Betas are reported per counted allele.
+- **Greedy PCSF fallback.** It now returns one connected tree. Install `pcst_fast` for the exact
+  solver and for `num_clusters > 1`.
+
 ## Examples
 
 | Folder | What it shows |
 |---|---|
 | [`examples/tutorials/`](examples/tutorials/README.md) | 17 topic notebooks (00–16): data model and storage, chromosome GRMs and LOCO, G/E/A/D/G×E covariance, factor decomposition, mvBLUP, prediction experts, multivariate GWAS on Zarr, effective tests, fine mapping with LD-aware SHAP, mediation, networks, haplotype GWAS, pedigree kinship, bootstrap uncertainty, end-to-end runs |
-| `examples/tutorials/synthetic/` | the same topics on simulated data (run anywhere, no inputs needed) |
+| `examples/tutorials/synthetic/` | the same topics on simulated data (run anywhere, no inputs needed); genotypes are written once to a reusable 2-bit packed Zarr store (`vigor.simulate_packed_cohort`) and streamed from it |
 | `examples/tutorials/real_hs/` | the same topics on your own project; copy [`examples/project_config.py`](examples/project_config.py) into `<project>/vigor_run/` and edit the paths |
 | [`examples/real26/`](examples/real26/MIGRATION.md) | full-cohort benchmark entrypoints (need a private 7,616-animal × 26-trait fixture) |
 | [`examples/quickstart.py`](examples/quickstart.py) | simulate a small PLINK dataset and run VIGOR end to end |

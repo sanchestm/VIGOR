@@ -5,4 +5,5 @@ from .proximity import build_proximal_gene_edges
 from .enrichment import gene_set_enrichment,locus_preserving_enrichment
 from .trait_space import TraitIntegrationResult,integrate_traits
 from .project import ProjectStoryResult,integrate_project_story
+from .finemap_pcsf import finemap_pcsf_inputs
 __all__=[x for x in globals() if not x.startswith('_')]
