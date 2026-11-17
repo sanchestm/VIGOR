@@ -156,17 +156,25 @@ grid and supports pruning, warm starts, time limits and resume. Use
 ### Multivariate GWAS
 
 ```python
-gwas = vigor.mvGWAS('genotypes/genotypes', Y, model='add-dom')   # exact score test, LOCO kernels
+gwas = vigor.mvGWAS('genotypes/genotypes', Y, model='add-dom')   # LOCO score test, fast engine
 ```
 
-The exact engine tests every variant in the full observed-space model. With complete
-phenotypes and one kernel it diagonalises V once per LOCO kernel, so a block of
-variants costs one matrix product rather than one solve per variant. With missing cells
-it uses block PCG, with the fixed-effect projection cached.
+The default `engine='fast'` uses the same inputs and output schema as the exact engine:
+- **Score.** X'Py is exact for every variant.
+- **Information.** D'PD is approximated: a ratio-calibrated genotype sum of squares on each
+  trait's observed animals, times a pooled trait correlation. It is fitted per chromosome
+  against exact information on `fast_calibration_variants=32` spread variants.
+- **Diagnostics.** In-sample agreement is in `attrs['scan_group_metadata']`.
+- **Cost.** One matrix product per block, with no covariance solve per variant even with
+  missing phenotypes.
 
-For genome-wide discovery on large panels, `engine='fast'` scans one GEMM per block
-against the projected dual of an exact null. It is calibrated with simulated null traits,
-so real signal cannot deflate it:
+`engine='exact'` evaluates D'PD for every variant. With complete phenotypes and one kernel
+it diagonalises V once per LOCO kernel. With missing cells it uses block PCG, which costs
+seconds per variant for many traits.
+
+The projected discovery scan (`engine='fast'` with `state=`) scans one GEMM per block against
+the projected dual of an exact null. It is calibrated with simulated null traits, so real
+signal cannot deflate it:
 
 ```python
 from vigor import mvgwas_fast
