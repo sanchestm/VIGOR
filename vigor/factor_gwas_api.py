@@ -175,18 +175,33 @@ def _psd_root(M):
     return (V * np.sqrt(np.clip(w, 0.0, None))) @ V.T
 
 
-def _kernel_root(K, jitter=1e-6):
-    """Lower float32 Cholesky factor of a dense kernel, raising jitter until it succeeds."""
+def _kernel_root(K, jitter=1e-8):
+    """Lower Cholesky factor (returned as float32) of a dense kernel, raising jitter until it succeeds.
+
+    Centred GRMs are exactly singular (the 1-vector is in their null space), so the
+    factorization runs in float64, where a tiny relative jitter suffices; float32
+    round-off would force jitter that adds spurious iid genetic variance to the null
+    draws and inflates S. A warning reports jitter above 1e-4 of the mean diagonal.
+    """
     from scipy.linalg import cholesky
-    base = np.asarray(K, np.float32)
-    scale = max(float(np.mean(np.diag(base))), np.finfo(np.float32).tiny)
-    for k in range(6):
-        work = np.array(base, dtype=np.float32, copy=True)
-        work[np.diag_indices_from(work)] += np.float32(jitter * 10 ** k * scale)
+    base = np.asarray(getattr(K, "values", K))
+    if base.ndim != 2 or base.shape[0] != base.shape[1] or base.dtype == object:
+        raise ValueError("null-trait calibration needs a dense square background kernel; "
+                         "materialize the GRM or use method='exact'")
+    scale = max(float(np.mean(np.diag(base))), np.finfo(np.float64).tiny)
+    for k in range(8):
+        added = jitter * 10 ** k * scale
+        work = np.array(base, dtype=np.float64, copy=True)
+        work[np.diag_indices_from(work)] += added
         try:
-            return cholesky(work, lower=True, overwrite_a=True, check_finite=False)
+            root = cholesky(work, lower=True, overwrite_a=True, check_finite=False)
         except np.linalg.LinAlgError:
             continue
+        if added > 1e-4 * scale:
+            warnings.warn(f"background kernel needed jitter {added / scale:.1e} x mean diagonal "
+                          "for the null-trait draws; S may be slightly conservative",
+                          RuntimeWarning, stacklevel=3)
+        return root.astype(np.float32)
     raise np.linalg.LinAlgError("background kernel is not positive semidefinite within jitter")
 
 
@@ -203,6 +218,12 @@ def _null_trait_frames(fitY, K, G, E, covariates, reps, seed):
             raise ValueError("multi-component G requires named background kernels")
         pairs = [(K[name], G[name]) for name in G]
     else:
+        if isinstance(K, Mapping):
+            # covariance_matrices returns a plain G for one component; unwrap a
+            # one-entry named background (GRM={'genetic': K}) to match.
+            if len(K) != 1:
+                raise ValueError("a single genetic covariance needs exactly one background kernel")
+            K = next(iter(K.values()))
         pairs = [(K, G)]
     roots = [(_kernel_root(Kk), _psd_root(Gk).astype(np.float32)) for Kk, Gk in pairs]
     Er = _psd_root(E).astype(np.float32)
@@ -371,7 +392,8 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
     from pathlib import Path
     if retired:
         raise TypeError("retired factorGWAS controls: " + ", ".join(sorted(retired)) +
-                        "; see docs/ROUND3_MIGRATION.md")
+                        ". gamma_snps/gamma_scope were replaced by null_reps (null-trait "
+                        "calibration of S); exact rescoring is opt-in via rescore_p")
     if method not in {"grammar_gamma", "exact"} or score_method not in {"direct", "subspace"}:
         raise ValueError("method must be 'grammar_gamma' or 'exact' and score_method 'direct'")
     fast = method == "grammar_gamma"
@@ -573,8 +595,12 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
             num += np.einsum("mki,mkj->kij", u0[good], u0[good], optimize=True)
             den += float(xx[good].sum())
             if rescore_p is not None:
-                # Provisional statistic (S not yet known) keeps a bounded candidate cache.
-                provisional = np.einsum("mi,ij,mj->m", u, sigma_inv, u) / np.where(good, xx, np.inf)
+                # Provisional statistic keeps a bounded candidate cache. The running S
+                # estimate (num/den so far) is on the final scale; sigma = Z'Z/n is only a
+                # fallback before any polymorphic variant, since LOCO usually makes S < sigma.
+                prov_inv = (np.linalg.pinv(num.mean(axis=0) / den, rcond=1e-10)
+                            if den > 0 else sigma_inv)
+                provisional = np.einsum("mi,ij,mj->m", u, prov_inv, u) / np.where(good, xx, np.inf)
                 for j in np.flatnonzero(provisional >= rescore_cache_stat):
                     candidates.append((provisional[j], len(stored), j, raw[:, j].copy()))
                 if len(candidates) > rescore_max:
@@ -584,13 +610,18 @@ def factorGWAS(traits, GRM=None, decomposition=None, genotypes=None, *,
         if not stored:
             return
         if den <= 0:
-            raise ValueError(f"group {group!r} has no polymorphic variants to calibrate S")
-        S_reps = num / den
+            # Every variant is monomorphic among the analysed animals: x'x = 0 gives
+            # rank-0, NaN statistics; one such group must not abort the whole scan.
+            warnings.warn(f"factorGWAS group {group!r} has no polymorphic variants; its "
+                          "statistics are NaN", RuntimeWarning, stacklevel=2)
+            S_reps = np.zeros_like(num)
+        else:
+            S_reps = num / den
         S = S_reps.mean(axis=0)
         Sinv = np.linalg.pinv(S, rcond=1e-10)
         # Held-out check: S from the other replicates, lambda on the left-out one.
         lambdas = []
-        if R >= 2:
+        if R >= 2 and den > 0:
             for k in range(R):
                 S_out = np.delete(S_reps, k, axis=0).mean(axis=0)
                 w = np.linalg.eigvalsh(S_out)

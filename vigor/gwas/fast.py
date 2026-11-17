@@ -8,8 +8,8 @@ idea):
 
     D'PD[(c,j),(d,k)] ~= sqrt(g_cj s_cj) sqrt(g_dk s_dk) * rho_cd * R_jk
 
-with ``s_cj`` the centered genotype sum of squares over animals observed for
-trait j, ``g_cj`` a per-contrast/trait ratio, ``rho_cd`` the per-variant
+with ``s_cj`` the genotype sum of squares over animals observed for trait j,
+re-centred within those animals (P removes each trait's own intercept), ``g_cj`` a per-contrast/trait ratio, ``rho_cd`` the per-variant
 correlation between design contrasts (additive vs dominance) and ``R`` a trait
 correlation of the information. ``g`` and ``R`` are fitted once per null
 against the exact ``D'PD`` of a few calibration variants (default 32, spread
@@ -54,6 +54,7 @@ class FastInformation:
         self.n_variants = int(n_variants)
         self.observed = np.asarray(observed, float)
         self.diagnostics = dict(diagnostics or {})
+        self.exact_fallback = False
         R = _sym(self.trait_correlation)
         w, V = np.linalg.eigh(R)
         largest = max(float(np.max(np.abs(w))), np.finfo(float).tiny)
@@ -79,6 +80,21 @@ def _observed_matrix(null):
     o = np.zeros(n * t)
     o[null.observed] = 1.0
     return o.reshape(n, t)
+
+
+def _within_trait_ss(Xsq_t_O, X_t_O, n_obs, dtype=np.float64):
+    """Genotype sum of squares re-centred within each trait's observed animals.
+
+    P removes each trait's own intercept over its observed cells, so the information
+    scales with sum_{i in obs_j} (x_i - mean_j x)^2 = sum x^2 - (sum x)^2 / n_j, not with
+    the sum around the all-animal mean. Arrays are (..., t); n_obs is (t,). ``dtype`` is
+    the precision the two sums were accumulated in: a difference within 64 eps of
+    sum x^2 is cancellation noise (a genotype constant within the trait) and is set to 0.
+    """
+    n_obs = np.asarray(n_obs, np.float64)
+    corr = np.divide(X_t_O * X_t_O, n_obs, out=np.zeros_like(X_t_O), where=n_obs > 0)
+    ss = Xsq_t_O - corr
+    return np.where(ss > 64 * np.finfo(dtype).eps * Xsq_t_O, ss, 0.0)
 
 
 def _as_designs(designs, n):
@@ -125,8 +141,12 @@ def calibrate_fast_information(null, designs, *, min_maf=0.05, attach=True):
     xc, finite = _center_designs(x, null.work_dtype)
     O = _observed_matrix(null)
     _, m, c = xc.shape
-    s = np.einsum("nmc,nt->mct", xc * xc, O, optimize=True)
-    good = (s.sum(axis=2) > 0).all(axis=1)
+    s = _within_trait_ss(np.einsum("nmc,nt->mct", xc * xc, O, optimize=True),
+                         np.einsum("nmc,nt->mct", xc, O, optimize=True), O.sum(axis=0))
+    # A variant calibrates whenever its first (additive) contrast is informative. Other
+    # contrasts with zero information (e.g. dominance without heterozygotes) add zero to
+    # both sides of the ratio-of-sums, so they cannot bias gamma.
+    good = s[:, 0, :].sum(axis=1) > 0
     dosage = x[:, :, 0]
     with np.errstate(invalid="ignore", divide="ignore"):
         freq = np.nanmean(dosage, axis=0) / 2.0
@@ -135,9 +155,11 @@ def calibrate_fast_information(null, designs, *, min_maf=0.05, attach=True):
     if keep.sum() < min(8, int(good.sum())):
         keep = good
     if not keep.any():
-        # Only monomorphic variants: every statistic is uninformative anyway.
+        # No informative calibration variant: never guess a scale. The group is then
+        # scored with the exact information (see fast_design_scores).
         fast = FastInformation(np.ones((c, t)), np.eye(t), c, 0, O,
-                               {"calibration_skipped_no_polymorphic_variants": 1.0})
+                               {"exact_fallback_no_informative_calibration_variant": 1.0})
+        fast.exact_fallback = True
         if attach:
             null._fast_information = fast
         return fast
@@ -228,15 +250,32 @@ def _fast_finalize(fast, u, s, xc, nobs):
         Pinv = (pv * np.where(pgood, 1.0 / np.where(pgood, pw, 1.0), 0.0)[:, None, :]) @ pv.transpose(0, 2, 1)
         projP = np.einsum("mij,mj->mi", pv ** 2, pgood.astype(float))
         rankP = pgood.sum(axis=1).astype(float)
+    Rinv = fast.trait_inverse
     zz = np.where(informative, z, 0.0)
-    W = zz @ fast.trait_inverse
+    W = zz @ Rinv
     y = np.einsum("mcd,mdt->mct", Pinv, W, optimize=True)
+    pdiag = np.einsum("mcc->mc", Pinv)
+    minv_diag = pdiag[:, :, None] * np.diag(Rinv)[None, None, :]
+    rank = (rankP * fast.trait_rank).astype(float)
+    # Coordinates of a live contrast that carry no information (e.g. a variant monomorphic
+    # among one trait's observed animals) must be dropped, not scored as z = 0. With
+    # M^-1 = Pinv (x) Rinv and U those coordinates, the informative-block inverse is the
+    # Schur complement M^-1_II - M^-1_IU (M^-1_UU)^-1 M^-1_UI; y_U = M^-1_UI z_I because
+    # z_U = 0. Only affected variants are looped over.
+    drop = ~informative & (pdiag[:, :, None] > 0)
+    for v in np.flatnonzero(drop.any(axis=(1, 2))):
+        cu, ju = np.nonzero(drop[v])
+        A = Pinv[v][np.ix_(cu, cu)] * Rinv[np.ix_(ju, ju)]
+        B = Pinv[v][:, cu][:, None, :] * Rinv[:, ju][None, :, :]        # (c, t, k)
+        Ai = np.linalg.pinv(A, rcond=1e-10, hermitian=True)
+        BA = B @ Ai
+        y[v] = y[v] - BA @ y[v][cu, ju]
+        minv_diag[v] = np.maximum(minv_diag[v] - np.einsum("ctk,ctk->ct", BA, B), 0.0)
+        rank[v] = max(rank[v] - np.linalg.matrix_rank(A, hermitian=True), 0.0)
     stat = np.maximum(np.einsum("mct,mct->m", zz, y, optimize=True), 0.0)
-    rank = rankP * fast.trait_rank
     stat = np.where(rank > 0, stat, np.nan)
     joint = y / root
-    joint_se = np.sqrt(np.maximum(np.einsum("mcc->mc", Pinv)[:, :, None]
-                                  * np.diag(fast.trait_inverse)[None, None, :], 0.0)) / root
+    joint_se = np.sqrt(minv_diag) / root
     estimable = informative & (projP[:, :, None] * fast.trait_projector[None, None, :] > 1 - 1e-7) & (joint_se > 0)
     res["joint_beta"] = np.where(estimable, joint, np.nan)
     res["joint_beta_se"] = np.where(estimable, joint_se, np.nan)
@@ -264,12 +303,14 @@ def calibrate_group(null, source, vm, samples, group, *, n_calibration=32, block
                     model="additive", min_maf=0.05):
     """Calibrate ``null`` on variants spread evenly along one scan group.
 
-    Decodes the group's genotype blocks once (no scoring) and keeps a strided
-    pool of 4 x n_calibration variants, then n_calibration with MAF >= min_maf
-    evenly spaced within the pool. Stops reading after the last pooled variant.
-    The calibration is cached on ``null`` and returned.
+    Decodes the group's genotype blocks once more (no scoring; the pool spans the
+    whole group, so the pass reads it to the end) and keeps a strided pool of
+    4 x n_calibration variants, then n_calibration with MAF >= min_maf evenly
+    spaced within the pool. The calibration is cached on ``null`` and returned.
     """
     from .scan import genotype_blocks
+    if isinstance(n_calibration, bool) or int(n_calibration) < 1:
+        raise ValueError("fast_calibration_variants must be a positive integer")
     keep = vm.chromosome.astype(str).to_numpy() == str(group)
     total = int(keep.sum())
     if total == 0:
@@ -316,13 +357,26 @@ def fast_design_scores(null, xc, finite, fast=None):
         idx = calibration_indices(m, 32)
         # xc is already centered; centering again is a no-op on observed calls.
         designs = np.where(finite[:, idx], xc[:, idx], np.nan)
-        fast = calibrate_fast_information(null, designs)
+        # Centred designs carry no allele frequency, so the MAF floor cannot apply here.
+        fast = calibrate_fast_information(null, designs, min_maf=0.0)
         fast.diagnostics["calibrated_on_first_block"] = 1.0
+    if getattr(fast, "exact_fallback", False):
+        b = np.eye(t)
+        spectral = _spectral_state(null)
+        if spectral is not None:
+            u, info, nobs = _spectral_scores(spectral, xc, finite, b)
+        else:
+            u, info, nobs = _generic_scores(null, xc, finite, b)
+        result, omnibus = _finalize_scores(u, info, nobs)
+        return result, omnibus, fast
     dt = np.dtype(null.work_dtype)
     X2 = xc.reshape(n, m * c)
     u = np.asarray(X2.T.astype(dt) @ null.dual.astype(dt), np.float64).reshape(m, c, t)
     O = fast.observed
-    s = np.asarray((X2 * X2).T.astype(dt) @ O.astype(dt), np.float64).reshape(m, c, t)
-    nobs = (finite.reshape(n, m * c).T.astype(dt) @ O.astype(dt)).astype(np.float64).reshape(m, c, t)
+    Od = O.astype(dt)
+    s = _within_trait_ss(np.asarray((X2 * X2).T.astype(dt) @ Od, np.float64).reshape(m, c, t),
+                         np.asarray(X2.T.astype(dt) @ Od, np.float64).reshape(m, c, t),
+                         O.sum(axis=0), dtype=dt)
+    nobs = (finite.reshape(n, m * c).T.astype(dt) @ Od).astype(np.float64).reshape(m, c, t)
     result, omnibus = _fast_finalize(fast, u, s, xc, nobs)
     return result, omnibus, fast

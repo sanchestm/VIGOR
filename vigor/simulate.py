@@ -2212,7 +2212,8 @@ def simulate_packed_cohort(path, n_samples: int = 1000, n_variants: int = 5000,
                                    seed=gseed, overwrite=overwrite, pack_hardcalls=True,
                                    variant_chunk=int(variant_chunk), **gkw)
         import zarr
-        zarr.open_group(str(store), mode="a").attrs["vigor_packed_cohort"] = record
+        zarr.open_group(str(store), mode="a", zarr_format=3,
+                        use_consolidated=False).attrs["vigor_packed_cohort"] = record
         zarr.consolidate_metadata(str(store))
     G = _PackedGenotypeMatrix(store)
     res = simulate_traits_from_genotypes(G, n_traits=n_traits, seed=tseed, **dict(trait_kwargs or {}))

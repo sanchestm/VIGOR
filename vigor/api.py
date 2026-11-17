@@ -59,8 +59,14 @@ def mvGWAS(*args, engine="fast", out=None, **kwargs):
     if engine not in {"fast", "exact", "auto", "pipeline", "multivariate"}:
         raise ValueError("engine must be fast, exact, auto, pipeline or multivariate")
     selected = engine
+    if kwargs.get("state") is not None and selected != "fast":
+        raise ValueError(f"state= selects the projected discovery scan and needs engine='fast', "
+                         f"not engine={selected!r}")
     if selected == "fast" and kwargs.get("state") is not None:
         from . import mvgwas_fast as mf
+        if "score_engine" in kwargs:
+            raise ValueError("score_engine= applies to the score scans, not to the projected "
+                             "discovery scan selected by state=")
         state = kwargs.pop("state")
         genotypes = args[0] if args else kwargs.pop("genotypes", None)
         if genotypes is None:

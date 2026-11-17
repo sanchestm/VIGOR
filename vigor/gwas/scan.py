@@ -185,9 +185,11 @@ def covariance_matrices(result):
 def _additive_numerator(source, vm, samples, select, *, block_size, min_maf, compute_dtype):
     """Unnormalized VanRaden numerator Z Z' and weight sum(2pq) over selected variants.
 
-    Returns (numerator float32 n x n, weight) or (None, 0.0) when nothing is
-    polymorphic. VanRaden 'van' kernels are num / sum(2pq) with per-variant
-    centering, so numerators and weights add across disjoint variant sets.
+    Returns (numerator n x n in ``compute_dtype``, weight) or (None, 0.0) when
+    nothing is polymorphic. VanRaden 'van' kernels are num / sum(2pq) with
+    per-variant centering, so numerators and weights add across disjoint variant
+    sets. The numerator keeps ``compute_dtype`` so float64 scans are not rounded
+    through float32.
     """
     from ..grm_backend import grm_from_blocks
     def blocks():
@@ -198,14 +200,14 @@ def _additive_numerator(source, vm, samples, select, *, block_size, min_maf, com
     try:
         out, weights, _ = grm_from_blocks(blocks(), len(samples), method="van",
                                           components=("additive",), min_maf=min_maf,
-                                          dtype=compute_dtype, output_dtype=np.float32)
+                                          dtype=compute_dtype, output_dtype=compute_dtype)
     except ValueError as exc:
         if "no polymorphic variants" in str(exc):
             return None, 0.0
         raise
     weight = float(weights["additive"])
-    numerator = out["additive"]
-    numerator *= np.float32(weight)
+    numerator = np.asarray(out["additive"])
+    numerator *= numerator.dtype.type(weight)
     return numerator, weight
 
 
@@ -226,11 +228,13 @@ def _loco_from_cache(cache, source, vm, samples, group, *, block_size, min_maf, 
     own, wown = _additive_numerator(source, vm, samples, labels == str(group),
         block_size=block_size, min_maf=min_maf, compute_dtype=compute_dtype)
     weight = wtot - wown
-    if weight <= 0:
-        raise ValueError("LOCO has no background variants; supply an independent kernel")
-    # Reuse the group's buffer: peak memory is two n x n float32 matrices.
+    # wtot and wown are sums in different orders: a group holding every polymorphic
+    # variant leaves round-off (~1e-12), not zero, and must not be divided by.
+    if weight <= 1e-9 * max(wtot, np.finfo(float).tiny):
+        raise ValueError("LOCO has no polymorphic background variants; supply an independent kernel")
+    # Reuse the group's buffer: peak memory is two n x n matrices.
     out = total.copy() if own is None else np.subtract(total, own, out=own)
-    out /= np.float32(weight)
+    out /= out.dtype.type(weight)
     return out.astype(compute_dtype, copy=False)
 
 

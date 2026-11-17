@@ -67,6 +67,8 @@ def gtf_variant_priors(variants, gtf_path, *, variant_assembly=None,
     p=p.astype(np.int64)
     refs=v['ref'].fillna('').astype(str).to_numpy() if 'ref' in v else ['']*len(v)
     ends=p+np.maximum([len(s) for s in refs],1)-1
+    if v.chrom.isna().any():
+        raise ValueError('chrom names must be present')
     chrom=v.chrom.astype(str).to_numpy()
     if not np.all(pd.Index(chrom).notna()):
         raise ValueError('chrom names must be present')
@@ -88,7 +90,8 @@ def gtf_variant_priors(variants, gtf_path, *, variant_assembly=None,
     used_contigs=set()
     target_contigs=set(target)
     span={c:(int(p[target==c].min()),int(ends[target==c].max())) for c in target_contigs}
-    opener=gzip.open if str(gtf_path).endswith('.gz') else open
+    with open(Path(gtf_path),'rb') as probe:  # gzip/bgzip by magic bytes, not by suffix
+        opener=gzip.open if probe.read(2)==b'\x1f\x8b' else open
     with opener(Path(gtf_path),'rt') as f:
         for line in f:
             if not line.strip() or line.startswith('#'):continue
@@ -107,7 +110,8 @@ def gtf_variant_priors(variants, gtf_path, *, variant_assembly=None,
             attrs=dict(_GTF_ATTR.findall(fields[8]))
             sym=attrs.get('gene') or attrs.get('gene_name') or attrs.get('gene_id') or ''
             if kind=='gene':
-                level=2 if attrs.get('gene_biotype')=='protein_coding' else 1
+                biotype=attrs.get('gene_biotype') or attrs.get('gene_type')  # RefSeq/Ensembl or GENCODE
+                level=2 if biotype=='protein_coding' else 1
                 for j in hits:
                     code[j]=max(code[j],level)
                     if sym:symbols[j].add(sym)

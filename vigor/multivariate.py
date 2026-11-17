@@ -9204,18 +9204,22 @@ def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,
     pip=1-np.prod(1-alpha,axis=0);effects_can=np.sum(alpha[:,:,None]*postmean,axis=0);effects=effects_can@Tinv
     # LD matrices for credible-set purity. Constant, uninformative variants have
     # undefined empirical Pearson correlations; keep their identities, but treat
-    # internally computed unknown LD as zero. Explicit user-supplied NaN LD is invalid.
+    # unknown (NaN) LD as zero; see ld_array.
     r_generated=ld_r is None; r2_generated=ld_r2 is None
     if r_generated or r2_generated:
         ldz=_compute_variant_ld_raw(pd.DataFrame(X,columns=z['snps']),statistic='both')
         if r_generated:ld_r=ldz['r']
         if r2_generated:ld_r2=ldz['r2']
     def ld_array(value,*,generated):
+        # NaN LD marks an undefined correlation (zero-variance SNP, too few pairwise-complete
+        # samples, or an off-band cell of banded LD). fine_map_region forwards its own
+        # computed LD here as explicit input, so NaN is read as zero for every source;
+        # infinite or asymmetric matrices are still rejected.
         if isinstance(value,pd.DataFrame):value=value.loc[z['snps'],z['snps']]
         a=np.asarray(value,float)
         if a.shape!=(p,p):raise ValueError('LD must cover all variants')
-        if generated:
-            a=np.nan_to_num(a,nan=0.0,copy=True)
+        if np.isnan(a).any():
+            a=np.nan_to_num(a,nan=0.0,posinf=np.inf,neginf=-np.inf,copy=True)
         if not np.isfinite(a).all() or not np.allclose(a,a.T,atol=1e-8):
             raise ValueError('LD must be finite, symmetric and aligned to all variants')
         return a
@@ -9235,7 +9239,9 @@ def multitrait_bayes_finemap(genotypes,traits,*,G=None,E=None,heritability=None,
         for _ in range(int(null_permutations)):
             perm=multitrait_bayes_finemap(pd.DataFrame(X,columns=z['snps']),Y[rng.permutation(n)],
                 G=G,E=E,heritability=heritability,L=L,coverage=coverage,prior_scales=prior_scales,
-                prior_weights=pi,prior_mixture_weights=qw,max_iter=max_iter,tol=tol,ld_r=ld_r,ld_r2=ld_r2,
+                prior_weights=pi,prior_mixture_weights=qw,max_iter=max_iter,tol=tol,
+                ld_r=pd.DataFrame(R,index=z['snps'],columns=z['snps']),
+                ld_r2=pd.DataFrame(R2,index=z['snps'],columns=z['snps']),
                 estimate_residual_scale=estimate_residual_scale,residual_covariance=mode,
                 covariance_shrinkage=covariance_shrinkage,covariance_floor=covariance_floor,
                 residual_update_interval=residual_update_interval,cs_min_logbf=cs_min_logbf,
@@ -10265,6 +10271,8 @@ def fine_map_region(genotypes,traits,*,G=None,E=None,heritability=None,methods=(
     # likelihood observations or calibrated causal-gene probabilities.
     gene_annotations=None;gene_scores=None;pcsf_inputs=None
     gtf_w=None
+    if pcsf_export and not ({'bayes','mvsusie'} & set(methods)):
+        raise ValueError("pcsf_export needs the Bayesian fit: include 'bayes' in methods")
     if pcsf_export and (gtf_path is None or gtf_variant_metadata is None):
         raise ValueError('pcsf_export requires GTF and SNP-indexed metadata with alleles A1/A2')
     if pcsf_export and pcsf_genotype_dosage_allele not in {'A1','A2'}:
@@ -10306,7 +10314,8 @@ def fine_map_region(genotypes,traits,*,G=None,E=None,heritability=None,methods=(
         ranks['bayes_pip']=z['pip'].assign(snp=lambda d:d.snp.map(_normalize_snp_id)).set_index('snp').pip
         if gene_annotations is not None:
             gene_scores=gene_interval_scores(z['pip'].set_index('snp').pip,gene_annotations)
-            ranks['gtf_prior']=pd.Series(gtf_w,index=X.columns.astype(str)).rename_axis(None).reindex(ranks.index).to_numpy()
+            # ranks.index is X.columns normalized (chr prefix stripped) in the same order.
+            ranks['gtf_prior']=np.asarray(gtf_w,float)
             if pcsf_export:
                 from .integration.finemap_pcsf import finemap_pcsf_inputs
                 pcsf_inputs=finemap_pcsf_inputs(z,X,vm,gene_annotations,
@@ -26464,7 +26473,11 @@ decompose_GE = _legacy.decompose_GE
 
 def mvGWAS(traitdf, genotypes="genotypes/genotypes", *, GRM=None, G=None, E=None,
            gwas_method="exact", mv_kernel_rank="full", **kwargs):
-    """Run the exact observed-space score engine; see gwas.scan.exact_mv_gwas.
+    """Run the observed-space score scan; see gwas.scan.exact_mv_gwas.
+
+    The default ``score_engine='fast'`` keeps the exact score and uses the calibrated
+    information approximation of vigor.gwas.fast; pass ``score_engine='exact'`` for exact
+    D'PD on every variant (this also applies to mvGWAS_local).
 
     Inputs: labeled Gaussian traitdf; genotype DataFrame/source/path; optional
     aligned GRM and matching trait covariance G/E; keyword options forwarded to

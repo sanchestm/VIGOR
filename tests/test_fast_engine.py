@@ -91,3 +91,34 @@ def test_fast_is_public_default_and_null_calibrated(tmp_path):
         assert .8 < lam < 1.25, f"{contrast} lambda={lam}"
     with pytest.raises(ValueError, match="conflicts"):
         vigor.mvGWAS(prefix, meta["pheno"], engine="exact", score_engine="fast")
+
+
+def test_fast_drops_coordinates_monomorphic_within_a_trait():
+    # Trait "b" is missing on rows 0, 5, 10, ...; this variant varies only on those rows,
+    # so it carries no information for "b". Fast must drop that coordinate like exact.
+    null, X = _null_fixture(True)
+    calibrate_fast_information(null, X.iloc[:, ::6].to_numpy())
+    rng = np.random.default_rng(7)
+    x = np.zeros(len(X), np.float32)
+    x[::5] = rng.binomial(2, .4, size=len(x[::5]))
+    G2 = pd.DataFrame({"mono_b": x, "v0": X.iloc[:, 0].to_numpy()}, index=X.index)
+    exact = score_block(null, G2)
+    fast = score_block(null, G2, engine="fast")
+    np.testing.assert_array_equal(fast.omnibus_dof.values, exact.omnibus_dof.values)
+    assert np.isnan(fast.sel(trait="b").z.values[0])
+    assert np.isfinite(fast.omnibus_stat.values).all()
+
+
+def test_fast_add_dom_without_heterozygotes_still_calibrates():
+    null, X = _null_fixture(True)
+    hom = (X.to_numpy(np.float32) >= 1).astype(np.float32) * 2  # 0/2 only: dominance constant
+    designs = np.stack([hom, np.zeros_like(hom)], axis=2)
+    from vigor.gwas.fast import calibrate_fast_information as cal
+    fast_info = cal(null, designs[:, ::6], attach=True)
+    assert not fast_info.exact_fallback and np.isfinite(fast_info.gamma[0]).all()
+    contrasts = ["additive", "dominance"]
+    exact = score_design_block(null, designs, contrast_names=contrasts)
+    fast = score_design_block(null, designs, contrast_names=contrasts, engine="fast")
+    np.testing.assert_array_equal(fast.omnibus_dof.values, exact.omnibus_dof.values)
+    r = np.corrcoef(fast.omnibus_neglog_p, exact.omnibus_neglog_p)
+    assert r[0, 1] > .97
